@@ -17,6 +17,14 @@
  *       include paths, exactly like other MM/AMXX plugins.
  */
 
+/*
+ * NOTE: metamod-r's plugin_info_t (metamod.h) has NO "unload" member — the struct is:
+ *   int interfaceVer; char *name; char *version; char *date; char *author;
+ *   char *url; char *logtag; PLUG_LOADTIME mustLoad;
+ * So this initializer must have exactly 8 members. The classic Metamod 1.20 struct
+ * additionally has an "unload" field (9 members) — if you ever build against it,
+ * add ", PT_ANYTIME" back as the last entry.
+ */
 plugin_info_t Plugin_info = {
 	META_INTERFACE_VERSION,
 	"ShotFix",
@@ -25,9 +33,12 @@ plugin_info_t Plugin_info = {
 	"FaTaL-[Hit]",
 	"https://t.me/Neo_Norm",
 	"SF",
-	PT_STARTUP,
-	PT_ANYTIME
+	PT_STARTUP
 };
+
+/* Plugin's supported load window: attach only at/before PT_STARTUP, detach anytime. */
+#define SF_LOAD_TIME PT_STARTUP
+#define SF_UNLOAD_TIME PT_ANYTIME
 
 enginefuncs_t g_engfuncs;
 globalvars_t *gpGlobals = NULL;
@@ -545,8 +556,9 @@ C_DLLEXPORT int Meta_Attach(PLUG_LOADTIME now, META_FUNCTIONS *pFunctionTable,
 							meta_globals_t *pMGlobals, gamedll_funcs_t *pGamedllFuncs) {
 	if (!pMGlobals || !pFunctionTable) return FALSE;
 
-	/* Refuse to attach at load times we don't support. */
-	if (now > Plugin_info.load) return FALSE;
+	/* Refuse to attach at load times we don't support.
+	   (Plugin_info has no .load/.unload members in metamod-r — use our own constants.) */
+	if (now > SF_LOAD_TIME) return FALSE;
 
 	gpMetaGlobals = pMGlobals;
 	gpGamedllFuncs = pGamedllFuncs;
