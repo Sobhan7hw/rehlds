@@ -1,11 +1,13 @@
-; Copy this line into addons/metamod/plugins.ini (or configs/metamod/plugins.ini on ReHLDS)
+; Copy these lines into addons/metamod/plugins.ini (or configs/metamod/plugins.ini on ReHLDS)
+
+; ---- ShotFix (رفع باگ شات/نمایش کامل تیر) ----
 ; Linux:
 linux addons/shot_fix/shotfix.so "ShotFix" "FaTaL-[Hit]" "v1.1" "" ""
 ; Windows (if you also build the dll):
 win32 addons/shot_fix/shotfix.dll "ShotFix" "FaTaL-[Hit]" "v1.1" "" ""
 
-; ---- ScreenCatch (اسکرین‌شات/میرور صفحه پلیر + تشخیص چیت) ----
+; ---- ClientShot (اسکرین‌شات + لیست پروسه از کلاینت، نیاز به ماژول کلاینت) ----
 ; Linux:
-linux addons/screen_catch/screencatch.so "ScreenCatch" "FaTaL-[Hit]" "v1.0" "" ""
+linux addons/clientshot/clientshot_server.so "ClientShot" "FaTaL-[Hit]" "v1.0" "" ""
 ; Windows:
-win32 addons/screen_catch/screencatch.dll "ScreenCatch" "FaTaL-[Hit]" "v1.0" "" ""
+win32 addons/clientshot/clientshot_server.dll "ClientShot" "FaTaL-[Hit]" "v1.0" "" ""
