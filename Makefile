@@ -27,15 +27,15 @@ OBJS     = shotfix.o
 all: $(TARGET)
 
 $(TARGET): $(OBJS)
-$(CXX) $(LDFLAGS) -o $@ $^ $(LIBS)
+	$(CXX) $(LDFLAGS) -o $@ $^ $(LIBS)
 
 %.o: %.cpp
-$(CXX) $(CXXFLAGS) -c -o $@ $<
+	$(CXX) $(CXXFLAGS) -c -o $@ $<
 
 clean:
-rm -f $(OBJS) $(TARGET)
+	rm -f $(OBJS) $(TARGET)
 
 install: $(TARGET)
-cp -f $(TARGET) "$(INSTALLDIR)"
+	cp -f $(TARGET) "$(INSTALLDIR)"
 
 .PHONY: all clean install
