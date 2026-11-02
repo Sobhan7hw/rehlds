@@ -9,7 +9,22 @@
 #include <sys/stat.h>
 
 /*
- * ShotFix 1.5 - Spray-consistency fix release for CS 1.6 / REHLDS / Metamod-R
+ * ShotFix 1.6 - Full-bullet-coverage release for CS 1.6 / REHLDS / Metamod-R
+ *
+ * Changelog vs 1.5 (from your console logs):
+ * THE BIG ONE: the min_trace_len >= 4096 clamp + raw-length check killed
+ * almost every bullet. Logs showed short_tr=14..15 with APPLIED=0 while
+ * standing still, and eye_skip=14..28 during sprays. Root cause: bullets
+ * start at the GUN ORIGIN (~origin+16, i.e. ~a few units BELOW the eye) and
+ * trace exactly RANGE (8192), but depending on stance/ducking the measured
+ * raw length varied (8192..8246) and moving shooters shifted the start away
+ * from the eye snapshot taken this frame. Fix: identify bullets by the
+ * distance from the EYE to the TRACE END:
+ *        |v2 - eye| in [RANGE - 300, RANGE + 400]
+ * which holds for every weapon fired from any stance/movement, while knife
+ * hulls (~50u), tracers and AMXX hitscans never reach that band. Eye-start
+ * tolerance raised to 128u. The old raw-length gate now uses a low floor
+ * (1000) only as a sanity pre-filter; the eye-end window is authoritative.
  *
  * Changelog vs 1.4 (console showed exact=13..15 + cone_skip=26 + erratic
  * APPLIED while spraying; players still felt "lag after shooting"):
@@ -56,7 +71,7 @@
 plugin_info_t Plugin_info = {
 	META_INTERFACE_VERSION,
 	"ShotFix",
-	"1.5",
+	"1.6",
 	__DATE__,
 	"FaTaL-[Hit]",
 	"https://t.me/Neo_Norm",
@@ -215,7 +230,7 @@ static void SetDefaults() {
 	g_Cfg.punch_aim = 1.0f;
 	g_Cfg.recoil_scale = 0.8f;
 	g_Cfg.max_spread_deg = 10.0f;
-	g_Cfg.min_trace_len = 4096.0f;
+	g_Cfg.min_trace_len = 1000.0f;
 	g_Cfg.require_attack = 0;
 	g_Cfg.apply_to_bots = 1;
 	g_Cfg.debug = 1;
@@ -233,9 +248,11 @@ static void ClampConfig() {
 	g_Cfg.punch_aim = clampf(g_Cfg.punch_aim, 0.0f, 1.0f);
 	g_Cfg.recoil_scale = clampf(g_Cfg.recoil_scale, 0.0f, 1.0f);
 	g_Cfg.max_spread_deg = clampf(g_Cfg.max_spread_deg, 2.0f, 30.0f);
-	/* Bullets trace at RANGE (8192). Anything under 4096 is a knife hull /
-	   tracer / AMXX hitscan and must never be touched -> hard floor here. */
-	g_Cfg.min_trace_len = clampf(g_Cfg.min_trace_len, 4096.0f, 8000.0f);
+	/* Sanity pre-filter only: the authoritative bullet test is the eye-end
+	   window below (|v2-eye| ~ RANGE). Floor stays low so we never reject a
+	   real bullet again; ceiling keeps it under RANGE so short traces can't
+	   accidentally qualify via the end-window when start!=eye. */
+	g_Cfg.min_trace_len = clampf(g_Cfg.min_trace_len, 500.0f, 8000.0f);
 	if (g_Cfg.unlag < 0.0f) g_Cfg.unlag = -1.0f;
 	if (g_Cfg.maxunlag < 0.0f) g_Cfg.maxunlag = -1.0f;
 	if (g_Cfg.unlagpush < 0.0f) g_Cfg.unlagpush = -1.0f;
@@ -367,10 +384,22 @@ static bool IsShotgun(edict_t *pl) {
 static int g_InRecursion = 0;
 
 /* CS 1.6 player models are about 72 units tall; the eye sits ~16 above origin.
-   A real bullet trace starts within a few units of the eye position. Anything
-   starting far away is NOT a bullet (hitscan checks from other entities,
-   laser/tracer effects, etc.) and must be passed through untouched. */
-#define SF_EYE_TOLERANCE 64.0f
+   Bullets start at the gun/shell origin which is within a few units of the
+   eye, but the shooter MOVES between the last synced position and the trace,
+   and crouch/duck shifts view_ofs - so keep this generous. The authoritative
+   bullet test is the eye-end window below, not this one. */
+#define SF_EYE_TOLERANCE 128.0f
+
+/* Bullet traces run exactly RANGE (default 8192) from the muzzle. Measured
+   from the EYE, |v2-eye| therefore lands in [RANGE-40, RANGE+40] for any
+   stance/movement (start is never more than ~40u from the eye). Window:
+   [RANGE-300, RANGE+400] leaves ample margin for duck-jump-crouch combos
+   while knife hulls (~50u), tracers, step-checks and AMXX hitscans can
+   never reach it. If a server sets fwpn_... or mods change RANGE far from
+   8192, adjust these two constants together. */
+#define SF_RANGE_CENTER 8192.0f
+#define SF_END_LO (SF_RANGE_CENTER - 300.0f)
+#define SF_END_HI (SF_RANGE_CENTER + 400.0f)
 
 static void OnTraceLine(const float *v1, const float *v2, int fNoMonsters,
 						edict_t *skip, TraceResult *ptr) {
@@ -401,9 +430,19 @@ static void OnTraceLine(const float *v1, const float *v2, int fNoMonsters,
 
 	float d[3] = { v2[0] - v1[0], v2[1] - v1[1], v2[2] - v1[2] };
 	float len2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
-	/* Real bullet traces use RANGE (default 8192). Short traces are knife
-	   hull-checks, step sounds, hitbox tests, etc. -> never touch them. */
+	/* Sanity pre-filter (see ClampConfig): the authoritative test is the
+	   eye->trace-END window below. */
 	if (len2 < g_Cfg.min_trace_len * g_Cfg.min_trace_len) { g_Cnt[4]++; return; }
+
+	/* BULLET IDENTIFICATION (v1.6): distance from the EYE to the trace END.
+	   Bullets travel exactly RANGE from a muzzle that is within ~40u of the
+	   eye, so |v2-eye| always falls inside [RANGE-300, RANGE+400] no matter
+	   the stance or movement - unlike raw trace length / start distance,
+	   which in 1.5 rejected most real bullets (short_tr/eye_skip floods). */
+	float tx = v2[0] - ex, ty = v2[1] - ey, tz = v2[2] - ez;
+	float endLen = sqrtf(tx * tx + ty * ty + tz * tz);
+	if (endLen < SF_END_LO || endLen > SF_END_HI) { g_Cnt[4]++; return; }
+
 	float len = sqrtf(len2);
 	float inv = 1.0f / len;
 	d[0] *= inv; d[1] *= inv; d[2] *= inv;
@@ -451,7 +490,7 @@ static void OnTraceLine(const float *v1, const float *v2, int fNoMonsters,
 
 	/* record stats only for traces that actually qualified as bullets */
 	g_LastStartDist = sqrtf(sd2);
-	g_LastLen = len;
+	g_LastLen = endLen; /* eye->END distance: the v1.6 bullet signature */
 	g_LastDev = sqrtf(dl2);
 
 	if (dl2 < 1e-8f) { g_Cnt[5]++; return; }            /* no spread at all: leave it */
@@ -579,7 +618,7 @@ static void OnStartFrame() {
 			}
 			if (changed) {
 				ConPrint(SF_TAG " dbg(+3s): total=%u | botdead=%u eye_skip=%u short_tr=%u exact=%u cone_skip=%u APPLIED=%u"
-						 " | last: start=%.1f len=%.0f dev=%.4f\n",
+						 " | last: start=%.1f len=%.0f end=%.0f dev=%.4f\n",
 						 delta[0], delta[2], delta[3], delta[4], delta[5], delta[6], delta[7],
 						 g_LastStartDist, g_LastLen, g_LastDev);
 				memcpy(g_CntPrev, g_Cnt, sizeof(g_Cnt));
@@ -684,7 +723,7 @@ C_DLLEXPORT int Meta_Attach(PLUG_LOADTIME now, META_FUNCTIONS *pFunctionTable,
 	ApplyCvars();
 	g_On = 1;
 
-	ConPrint(SF_TAG " v1.5 loaded (%s): spread=%.2f shotgun=%.2f punch_aim=%.2f recoil=%.2f debug=%d\n",
+	ConPrint(SF_TAG " v1.6 loaded (%s): spread=%.2f shotgun=%.2f punch_aim=%.2f recoil=%.2f debug=%d\n",
 			 found ? g_CfgPath : "no ini, defaults",
 			 g_Cfg.spread_scale, g_Cfg.shotgun_scale, g_Cfg.punch_aim, g_Cfg.recoil_scale, g_Cfg.debug);
 	return TRUE;
