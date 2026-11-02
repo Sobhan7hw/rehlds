@@ -9,27 +9,39 @@
 #include <sys/stat.h>
 
 /*
- * ShotFix 1.3 - Lag/Desync Fix Release for CS 1.6 / REHLDS / Metamod-R
+ * ShotFix 1.4 - Bullet identification fix release for CS 1.6 / REHLDS / Metamod-R
  *
- * What changed vs v1.2 (the "shots feel like lag" report):
- * 1. AIM REFERENCE FIXED: previous builds reconstructed the aim vector by hand
- *    with a wrong pitch sign (+sin instead of the engine's -sin convention).
- *    Sprayed bullets were measured against an inverted reference and yanked
- *    off-target -> hits disagreed with what the shooter saw (= perceived lag).
- *    Now we call pfnAngleVectors() itself, exactly like the game does.
- * 2. BULLET FILTER FIXED: the old "len > 8192" rejection killed every normal
- *    bullet (they trace at exactly RANGE=8192), so most shots fell into the
- *    start_far bucket inconsistently. Filter now: eye-proximity (48u) + min
- *    length only; max angle off aim is configurable via max_spread_deg (5 deg
- *    default covers AK/M4 in-air crouch-spread up to ~4.7 deg).
- * 3. RECOIL HOOK SAFETY: decay kicks are never rescaled (only fresh upward
- *    punches), the IN_ATTACK gate was removed (recoil applies on the shot
- *    frame regardless of button state timing), and punch edits happen before
- *    the edict is networked this frame - no client desync.
- * 4. DEBUG OUTPUT: fixed duplicated counter column (bot/dead merged into one
- *    honest field); dev now printed with 4 decimals.
- * 5. INI: new key max_spread_deg (old max_spread_dev/max_start_offset keys are
- *    still accepted for compatibility).
+ * Changelog vs 1.3 (console showed notfiring=14..15 idle per 3s, huge
+ * start_far, APPLIED far below actual bullet count):
+ * 1. require_attack / IN_ATTACK gate REMOVED from the TraceLine hook. In HL
+ *    player post-think order, pev->button is already cleared to 0 during
+ *    PlayerRunPostThink, i.e. BEFORE weapon logic fires bullets. Any plugin
+ *    or ini setting that enabled the gate therefore rejected EVERY real
+ *    bullet (notfiring == total while idling). Spread filtering now relies
+ *    purely on geometry (start-at-eye + length + cone), which cannot false
+ *    negative. The ini key is still parsed but ignored, for compatibility.
+ * 2. AIM REFERENCE = v_angle ONLY (no punchangle added). In CS 1.6 the bullet
+ *    direction is AngleVectors(eye angles incl. punch) PLUS a random spread
+ *    cone around THAT axis. Measuring deviation against v_angle+punch made
+ *    bullets fired while punching-decayed look far off-axis -> bigdev/startfar
+ *    skips and inconsistent hit registration (perceived lag). With plain
+ *    v_angle as the axis, |dev| is exactly the spread cone (<= ~4.7 deg for
+ *    rifles, larger for shotguns) and scaling it toward the crosshair is the
+ *    intended behaviour, deterministic and symmetric.
+ * 3. EYE TOLERANCE raised 48 -> 64 units: traces may start slightly offset
+ *   (duck-jump interpolation, lag-compensated starts) and must not be dropped.
+ * 4. SHOTGUN CONE: rifle-class traces are capped at max_spread_deg (5 deg);
+ *    shotgun pellets get 3x that window (M3/XM1014 pellet cones exceed 5 deg)
+ *    so their spread reduction actually applies instead of falling to bigdev.
+ * 5. DEBUG COLUMNS renamed to match reality: eye_skip / short_tr / exact /
+ *    cone_skip / APPLIED. Idle baseline (~14-15 traces/3s per player slot:
+ *    step-sound ground checks etc.) is expected and harmless - they are all
+ *    short traces that pass through untouched.
+ *
+ * Kept from 1.3: pfnAngleVectors() as the single source of truth for aim math
+ * (engine convention z = -sin(pitch)), re-entrancy guard, pre/post punch
+ * snapshot recoil scaler (fresh kicks only, decay untouched), ini hot-reload,
+ * cvar enforcement with save/restore.
  */
 
 // Define load time explicitly to avoid struct mismatch issues in some MM versions
@@ -39,7 +51,7 @@
 plugin_info_t Plugin_info = {
 	META_INTERFACE_VERSION,
 	"ShotFix",
-	"1.3",
+	"1.4",
 	__DATE__,
 	"FaTaL-[Hit]",
 	"https://t.me/Neo_Norm",
@@ -80,8 +92,9 @@ static double g_LastEnforce = 0.0;
 static float g_PrePunch[SF_MAX_CLIENTS + 1][3];
 static unsigned char g_PreValid[SF_MAX_CLIENTS + 1];
 
-/* debug counters: 0 total, 1 not firing, 2 bot/dead skip, 3 start far from eye,
-   4 short trace, 5 already exact (zero spread), 6 deviation too big, 7 applied */
+/* debug counters: 0 total player traces, 1 unused (was attack-gate), 2 bot/dead skip,
+   3 start far from eye, 4 short trace, 5 already exact (zero spread), 6 outside cone,
+   7 applied */
 static unsigned g_Cnt[8];
 static unsigned g_CntPrev[8];
 static float    g_LastStartDist = 0.0f;
@@ -346,7 +359,7 @@ static int g_InRecursion = 0;
    A real bullet trace starts within a few units of the eye position. Anything
    starting far away is NOT a bullet (hitscan checks from other entities,
    laser/tracer effects, etc.) and must be passed through untouched. */
-#define SF_EYE_TOLERANCE 48.0f
+#define SF_EYE_TOLERANCE 64.0f
 
 static void OnTraceLine(const float *v1, const float *v2, int fNoMonsters,
 						edict_t *skip, TraceResult *ptr) {
@@ -362,7 +375,6 @@ static void OnTraceLine(const float *v1, const float *v2, int fNoMonsters,
 
 	g_Cnt[0]++;
 
-	if (g_Cfg.require_attack && !(skip->v.button & IN_ATTACK)) { g_Cnt[1]++; return; }
 	if ((fl & FL_FAKECLIENT) && !g_Cfg.apply_to_bots) { g_Cnt[2]++; return; }
 	if (skip->v.deadflag != DEAD_NO) { g_Cnt[2]++; return; }
 
@@ -386,31 +398,26 @@ static void OnTraceLine(const float *v1, const float *v2, int fNoMonsters,
 	d[0] *= inv; d[1] *= inv; d[2] *= inv;
 
 	/* ================================================================
-	   AIM REFERENCE VECTOR - THE REAL LAG FIX (v1.3):
+	   AIM REFERENCE VECTOR (v1.4):
 
-	   In CS 1.6 the bullet direction is computed from the player's
-	   CURRENT view angles (which already include the recoil punch) and
-	   random spread is added on top of that. So the correct reference
-	   to measure the spread cone against is exactly:
-	       AngleVectors( v_angle + punchangle )
+	   In CS 1.6 each bullet direction = AngleVectors(eye angles incl.
+	   punch) rotated by a small RANDOM cone (the weapon spread). The
+	   crosshair on screen points along v_angle, so the honest measure of
+	   "how far this bullet strayed from where the player aimed" is the
+	   angle between the trace dir and plain v_angle. That angle IS the
+	   spread cone (plus whatever punch contribution exists), and scaling
+	   it toward v_angle tightens grouping around the visible crosshair -
+	   deterministic, symmetric, and frame-independent.
 
-	   The previous builds reconstructed this vector by hand using the
-	   mathematical convention z = +sin(pitch). The Half-Life engine uses
-	   z = -sin(pitch) for pev->angles.x. That sign error inverted the
-	   vertical component of our reference: every upward-sprayed bullet
-	   appeared as a huge fake "deviation" and we yanked it toward the
-	   wrong direction -> shots landed away from the crosshair, server
-	   hits disagreed with what the shooter saw, and it felt exactly like
-	   lag/rubber-banding.
-
-	   FIX: call pfnAngleVectors() itself - byte-for-byte the same math
-	   the game uses - so our reference aim is identical to vanilla and
-	   |dev| really is only the random spread cone we intend to scale.
+	   v1.3 measured against v_angle+punchangle instead: during a spray the
+	   punch decays every frame, so bullets alternately looked "on-axis"
+	   (exact_ign) or "far off-axis" (bigdev/start_far) depending on punch
+	   phase -> inconsistent partial application, which players felt as lag.
 	   Roll (z) does not affect the forward vector, hence 0.
 	   ================================================================ */
 	float ang[3] = {
-		skip->v.v_angle.x + skip->v.punchangle.x,
-		skip->v.v_angle.y + skip->v.punchangle.y,
+		skip->v.v_angle.x,
+		skip->v.v_angle.y,
 		0.0f
 	};
 	float fwd[3];
@@ -425,12 +432,18 @@ static void OnTraceLine(const float *v1, const float *v2, int fNoMonsters,
 	g_LastDev = sqrtf(dl2);
 
 	if (dl2 < 1e-8f) { g_Cnt[5]++; return; }            /* no spread at all: leave it */
-	/* Angle between bullet dir and aim dir: for unit vectors, |dev| ~ sin(theta).
-	   Anything wider than max_spread_deg is not a weapon spread cone -> ignore. */
-	float maxsin = sinf(Rad(g_Cfg.max_spread_deg));
+
+	int shotgun = IsShotgun(skip) ? 1 : 0;
+
+	/* Angle between bullet dir and aim axis: for unit vectors, |dev| ~ sin(theta).
+	   Rifle-class spread in CS 1.6 stays under ~4.7 deg; shotgun pellet cones are
+	   much wider, so they get a 3x window. Anything beyond the cone is NOT our
+	   business (tracer effects, other hitscan systems) -> pass through untouched. */
+	float deglimit = g_Cfg.max_spread_deg * (shotgun ? 3.0f : 1.0f);
+	float maxsin = sinf(Rad(deglimit));
 	if (dl2 > maxsin * maxsin) { g_Cnt[6]++; return; }
 
-	float sc = IsShotgun(skip) ? g_Cfg.shotgun_scale : g_Cfg.spread_scale;
+	float sc = shotgun ? g_Cfg.shotgun_scale : g_Cfg.spread_scale;
 	if (sc >= 0.999f) return;
 
 	float n[3] = { fwd[0] + dev[0] * sc, fwd[1] + dev[1] * sc, fwd[2] + dev[2] * sc };
@@ -541,9 +554,9 @@ static void OnStartFrame() {
 				if (delta[i] != 0) changed = true;
 			}
 			if (changed) {
-				ConPrint(SF_TAG " dbg(+3s): total=%u | notfiring=%u bot_dead_skip=%u start_far=%u short_tr=%u exact_ign=%u bigdev=%u APPLIED=%u"
+				ConPrint(SF_TAG " dbg(+3s): total=%u | botdead=%u eye_skip=%u short_tr=%u exact=%u cone_skip=%u APPLIED=%u"
 						 " | last: start=%.1f len=%.0f dev=%.4f\n",
-						 delta[0], delta[1], delta[2], delta[3], delta[4], delta[5], delta[6], delta[7],
+						 delta[0], delta[2], delta[3], delta[4], delta[5], delta[6], delta[7],
 						 g_LastStartDist, g_LastLen, g_LastDev);
 				memcpy(g_CntPrev, g_Cnt, sizeof(g_Cnt));
 			}
@@ -647,7 +660,7 @@ C_DLLEXPORT int Meta_Attach(PLUG_LOADTIME now, META_FUNCTIONS *pFunctionTable,
 	ApplyCvars();
 	g_On = 1;
 
-	ConPrint(SF_TAG " v1.3 loaded (%s): spread=%.2f shotgun=%.2f recoil=%.2f debug=%d\n",
+	ConPrint(SF_TAG " v1.4 loaded (%s): spread=%.2f shotgun=%.2f recoil=%.2f debug=%d\n",
 			 found ? g_CfgPath : "no ini, defaults",
 			 g_Cfg.spread_scale, g_Cfg.shotgun_scale, g_Cfg.recoil_scale, g_Cfg.debug);
 	return TRUE;
