@@ -1,8 +1,17 @@
 /*
- * ScreenWatch 1.4 - SERVER metamod plugin (CS 1.6 / ReHLDS / Metamod-R)
+ * ScreenWatch 1.5 - SERVER metamod plugin (CS 1.6 / ReHLDS / Metamod-R)
  * Author: FaTaL-[Hit]  https://t.me/Neo_Norm
  *
- * v1.4 changes (compile fixes for Metamod-R):
+ * v1.5 changes (strict compile fixes for Metamod-R SDK headers):
+ *  - usermsg registration resolved at runtime via dlsym() only: no direct
+ *    access to mutil_funcs_t::pfnRegUserMsg (does not exist in metamod-r),
+ *    gamedll_funcs_t::dll_table (named dllapi_table) or enginefuncs_t::
+ *    pfnUserMsgID (not a member of the classic table).
+ *  - HUD_PRINTCONSOLE cast to PRINT_TYPE for pfnClientPrintf.
+ *  - META_FUNCTIONS slots cast through a void(*)() typedef (C++ forbids
+ *    implicit function-pointer -> void* conversion).
+ *  - Plugin_info matches metamod plinfo.h field order exactly.
+ * v1.4 changes:
  *  - No pfnRegUserMsg access at all (metamod-r mutil_funcs_t has no such
  *    member). usermsg "SWRq" is registered via gameDLL pfnUserMsgRegister +
  *    engine pfnUserMsgID lookup; graceful fallback to the console trigger.
@@ -23,8 +32,12 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 
+/* pfnClientPrintf destination type/macro portability */
 #ifndef HUD_PRINTCONSOLE
-#define HUD_PRINTCONSOLE 2   /* enginefuncs pfnClientPrintf dest */
+#define HUD_PRINTCONSOLE 2
+#endif
+#ifndef PRINT_TYPE
+typedef int PRINT_TYPE;
 #endif
 
 #define SW_TAG "[SW]"
@@ -53,16 +66,29 @@ static mutil_funcs_t *g_pMetaUtil = NULL;
 static int g_msgSwReq = 0;
 
 /* Custom usermsg "SWRq" registration.
-   mutil_funcs_t in metamod-r has NO pfnRegUserMsg member (and its exact
-   layout varies between MM forks), so we never poke it directly. We register
-   through the game DLL's exported UserMsgRegister and look the id up via the
-   engine. If that is unavailable we fall back to the console-line trigger
-   ("sw_do"), which works everywhere. */
+   mutil_funcs_t in metamod-r has NO pfnRegUserMsg member, and the classic
+   HLSDK enginefuncs table has no usermsg-id lookup either (it lives in
+   ReGameDLL/ReHLDS extensions). To stay compile-portable across ALL of them,
+   we resolve the two entry points at runtime with dlsym() from the already
+   loaded libraries (metamod.so / engine.so / cstrike.so). If nothing is
+   found we simply return 0 and the console-line trigger ("sw_do") carries
+   every request - that path works on any server build. */
+#include <dlfcn.h>
+
+typedef void (*UserMsgRegisterFn)(const char *name, int size, int *pMsgId);
+typedef int  (*UserMsgIDFn)(const char *pszName, int *pid);
+
 static int RegisterUserMsg(const char *name, int size) {
-	if (gpGamedllFuncs && gpGamedllFuncs->dll_table &&
-	    gpGamedllFuncs->dll_table->pfnUserMsgRegister) {
-		gpGamedllFuncs->dll_table->pfnUserMsgRegister(name, size, NULL);
-		int id = g_engfuncs.pfnUserMsgID(name, NULL);
+	/* 1) register through the game DLL if it exports UserMsgRegister */
+	UserMsgRegisterFn reg = (UserMsgRegisterFn)dlsym(RTLD_DEFAULT, "pfnUserMsgRegister");
+	if (!reg) reg = (UserMsgRegisterFn)dlsym(RTLD_DEFAULT, "UserMsgRegister");
+	if (reg) reg(name, size, NULL);
+
+	/* 2) look the id up: ReEngine exposes GetUserMsgID / pfnUserMsgID */
+	UserMsgIDFn getid = (UserMsgIDFn)dlsym(RTLD_DEFAULT, "GetUserMsgID");
+	if (!getid) getid = (UserMsgIDFn)dlsym(RTLD_DEFAULT, "pfnUserMsgID");
+	if (getid) {
+		int id = getid(name, NULL);
 		if (id > 0) return id;
 	}
 	return 0; /* fallback console trigger still works */
@@ -279,7 +305,7 @@ static void SendRequest(int idx, int flags) {
 	   console; screenwatch.cfg aliases sw_do to the client module export. */
 	char txt[64];
 	snprintf(txt, sizeof(txt), "\nsw_do %d\n", flags);
-	g_engfuncs.pfnClientPrintf(e, HUD_PRINTCONSOLE, txt);
+	g_engfuncs.pfnClientPrintf(e, (PRINT_TYPE)HUD_PRINTCONSOLE, txt);
 
 	if (g_Cfg.debug) ConPrint(SW_TAG " -> req flags=%d slot=%d\n", flags, idx);
 }
@@ -533,9 +559,8 @@ void CmdSwImpl(const char *args) {
 /* ------------------------------------------------------------------ */
 
 plugin_info_t Plugin_info = {
-	META_INTERFACE_VERSION,
 	"ScreenWatch",
-	"1.4",
+	"1.5",
 	__DATE__,
 	"FaTaL-[Hit]",
 	"https://t.me/Neo_Norm",
@@ -567,12 +592,16 @@ C_DLLEXPORT int GetEntityAPI2_Post(DLL_FUNCTIONS *pFunctionTable, int *interface
 	return TRUE;
 }
 
+/* Cast slots to void*: strict C++ rejects implicit function-pointer ->
+   void* conversion inside brace initializers. */
+typedef void (*SWVoidFn)(void);
+#define SW_FN(p) ((const void *)(SWVoidFn)(p))
 META_FUNCTIONS gMetaFunctionTable = {
-	NULL, NULL,
-	GetEntityAPI2,
-	GetEntityAPI2_Post,
-	NULL, NULL,
-	NULL, NULL
+	SW_FN(0), SW_FN(0),
+	SW_FN(GetEntityAPI2),
+	SW_FN(GetEntityAPI2_Post),
+	SW_FN(0), SW_FN(0),
+	SW_FN(0), SW_FN(0)
 };
 
 C_DLLEXPORT void GiveFnptrsToDll(enginefuncs_t *pengfuncs, globalvars_t *pGlobals) {
@@ -610,7 +639,7 @@ C_DLLEXPORT int Meta_Attach(PLUG_LOADTIME now, META_FUNCTIONS *pFunctionTable,
 	g_NextSweep = NowSec() + 10.0;
 
 	g_On = 1;
-	ConPrint(SW_TAG " v1.4 loaded (Author: FaTaL-[Hit]). dir=%s scan_on_join=%d interval=%ds msgid=%d\n",
+	ConPrint(SW_TAG " v1.5 loaded (Author: FaTaL-[Hit]). dir=%s scan_on_join=%d interval=%ds msgid=%d\n",
 	         g_Cfg.save_dir, g_Cfg.scan_on_join, g_Cfg.interval_sec, g_msgSwReq);
 	return TRUE;
 }

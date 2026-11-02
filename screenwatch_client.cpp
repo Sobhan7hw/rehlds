@@ -1,5 +1,5 @@
 /*
- * ScreenWatch 1.4 - CLIENT module (Windows, CS 1.6)
+ * ScreenWatch 1.5 - CLIENT module (Windows, CS 1.6)
  * by FaTaL-[Hit] - https://t.me/Neo_Norm
  * Loaded via dll_load (revEmu etc.) or a server launcher. Player is notified
  * in-game and can opt out any time with "sw_off".
@@ -23,6 +23,12 @@ static volatile LONG g_Busy = 0;
 static volatile LONG g_Enabled = 1;   /* player can opt out: sw_off */
 
 #define SW_CHUNK_BYTES 384
+
+/* Cross-compile note (Linux -> Windows 32bit):
+   sudo apt install g++-mingw-w64-i686
+   i686-w64-mingw32-g++ -O2 -Wall -shared -static -s -o sw_client.dll \
+       screenwatch_client.cpp -lgdi32 -luser32
+*/
 
 static void SwCmd(const char *fmt, ...) {
 if (!g_pClientCmd) return;
@@ -135,7 +141,7 @@ SwCmd("%s_begin %d %d", cmdPrefix, (int)sz, chunks);
 BYTE raw[SW_CHUNK_BYTES];
 char hex[SW_CHUNK_BYTES * 2 + 8];
 for (int i = 0; i < chunks; i++) {
-size_t rd = fread(raw, 1, SW_CHUNK_BYTES, f);
+	size_t rd = fread(raw, 1, (size_t)SW_CHUNK_BYTES, f);
 hex[0] = 0;
 for (size_t j = 0; j < rd; j++) sprintf(hex + j * 2, "%02X", raw[j]);
 size_t pos = 0;
