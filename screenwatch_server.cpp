@@ -59,13 +59,13 @@ static int g_msgSwReq = 0;
    engine. If that is unavailable we fall back to the console-line trigger
    ("sw_do"), which works everywhere. */
 static int RegisterUserMsg(const char *name, int size) {
-if (gpGamedllFuncs && gpGamedllFuncs->dll_table &&
-    gpGamedllFuncs->dll_table->pfnUserMsgRegister) {
-gpGamedllFuncs->dll_table->pfnUserMsgRegister(name, size, NULL);
-int id = g_engfuncs.pfnUserMsgID(name, NULL);
-if (id > 0) return id;
-}
-return 0; /* AMXX menu still works: SendRequest also uses pfnClientPrintf */
+	if (gpGamedllFuncs && gpGamedllFuncs->dll_table &&
+	    gpGamedllFuncs->dll_table->pfnUserMsgRegister) {
+		gpGamedllFuncs->dll_table->pfnUserMsgRegister(name, size, NULL);
+		int id = g_engfuncs.pfnUserMsgID(name, NULL);
+		if (id > 0) return id;
+	}
+	return 0; /* fallback console trigger still works */
 }
 
 
