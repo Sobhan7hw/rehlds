@@ -9,26 +9,29 @@
 #include <sys/stat.h>
 
 /*
- * ShotFix 2.1 - Runtime RANGE-band bullet detection for CS 1.6 / REHLDS / Metamod-R
+ * ShotFix 2.3 - Hybrid angle+length bullet detection for CS 1.6 / REHLDS / Metamod-R
  *
- * Changelog vs v1.9 (console log analysis):
- *   v1.9 logs showed the RANGE band working ONLY when sv_range was exactly
- *   8192; on this server most bullets fell into "not_bullet" while spraying,
- *   i.e. the hardcoded [7892,8592] band does not match every server's actual
- *   bullet RANGE (sv_range can be overridden; ReHLDS/replay tooling and some
- *   configs change it). A fixed band is therefore the wrong invariant.
+ * Changelog vs v2.2 (console log analysis):
+ *   v2.2 (pure angular cone test) worked but leaked: ambient traces that run
+ *   along the player's view axis (knife-hull probes, AMXX visibility checks,
+ *   tracer effects) also sit inside the cone window and were counted as
+ *   bullets -> "exact=14 APPLIED=0" lines with ang=0.00 during idle walking,
+ *   and inconsistent APPLIED counts during sprays.
  *
- *   v2.1 reads sv_range at runtime and gates on:
- *        |traceEnd - eye| within [RANGE-600, RANGE+600]
- *   This keeps the two properties that made v1.9 robust:
- *     - measured from the EYE (origin+view_ofs), so stance/crouch/movement
- *       and lag-comp start-point drift do NOT matter;
- *     - endpoint distance, so knife hulls / step traces / tracer effects /
- *       AMXX hitscan (which end far closer than RANGE) are rejected cleanly.
- *   If sv_range is missing or absurd (<100), default 8192 is used.
+ *   v2.3 requires BOTH invariants of a real CS 1.6 bullet simultaneously:
+ *     1) DIRECTION inside the weapon spread cone around
+ *        AngleVectors(v_angle + punchangle*punch_aim)  (angular gate,
+ *        max_spread_deg, x3 window for shotguns) - stance/lag-comp proof; AND
+ *     2) LENGTH >= min_trace_len (default 4096, clampable 1000..8000) -
+ *        kills all short ambient/knife/hitscan traces that passed gate 1.
+ *   Real bullets trace at full RANGE (~8192) regardless of whether they hit a
+ *   wall (the game passes vecEnd = start + dir*RANGE), so gate 2 never clips
+ *   them even if sv_range is customized above ~4000. If your server runs an
+ *   extremely low sv_range, lower min_trace_len in the ini.
  *
- *   Debug line now prints end=<eye->end distance> so you can SEE the server's
- *   real RANGE in one spray.
+ *   Debug line now prints len=<trace length> ang=<deg off aim axis>.
+ *   Healthy spray signature: APPLIED ~= bullets fired, outside small, exact
+ *   only for the few zero-spread shots (first shot standing still).
  *
  *   Anti-lag core (unchanged since v1.5):
  *     Reference aim = pfnAngleVectors( v_angle + punchangle * punch_aim ),
@@ -46,7 +49,7 @@
 plugin_info_t Plugin_info = {
 	META_INTERFACE_VERSION,
 	"ShotFix",
-	"2.1",
+	"2.3",
 	__DATE__,
 	"FaTaL-[Hit]",
 	"https://t.me/Neo_Norm",
@@ -69,6 +72,7 @@ struct SfSettings {
 	float punch_aim;        /* 1.0 = bullets follow v_angle+punchangle exactly like vanilla */
 	float recoil_scale;
 	float max_spread_deg;   /* max angle (degrees) off the aim axis still treated as a bullet */
+	float min_trace_len;    /* traces shorter than this are never bullets (v2.3 length gate) */
 	int   apply_to_bots;
 	int   debug;
 	int   enforce_cvars;
@@ -87,12 +91,12 @@ static float g_PrePunch[SF_MAX_CLIENTS + 1][3];
 static unsigned char g_PreValid[SF_MAX_CLIENTS + 1];
 
 /* debug counters: 0 total player traces, 1 unused, 2 bot/dead skip,
-   3 not-bullet (eye->end outside RANGE band), 4 already exact (zero spread),
+   3 too-short trace (length gate), 4 already exact (zero spread),
    5 outside cone window, 6 unused, 7 applied */
 static unsigned g_Cnt[8];
 static unsigned g_CntPrev[8];
 static float    g_LastLen = 0.0f;
-static float    g_LastDev = 0.0f;
+static float    g_LastAngDeg = 0.0f;
 
 /* ------------------------------------------------------------------ */
 /* Helpers                                                             */
@@ -173,9 +177,9 @@ static int try_load_config(const char *path) {
 		else if (strcmp(key, "punch_aim") == 0)         g_Cfg.punch_aim = (float)atof(val);
 		else if (strcmp(key, "recoil_scale") == 0)      g_Cfg.recoil_scale = (float)atof(val);
 		else if (strcmp(key, "max_spread_deg") == 0)    g_Cfg.max_spread_deg = (float)atof(val);
-		/* legacy keys accepted but ignored (detection is eye->end RANGE band now) */
+		/* legacy keys accepted but ignored (v2.3 detection = angle cone + length gate) */
 		else if (strcmp(key, "max_spread_dev") == 0)    g_Cfg.max_spread_deg = (float)atof(val);
-		else if (strcmp(key, "min_trace_len") == 0)     { /* ignored */ }
+		else if (strcmp(key, "min_trace_len") == 0)     g_Cfg.min_trace_len = (float)atof(val);
 		else if (strcmp(key, "max_start_offset") == 0)  { /* ignored */ }
 		else if (strcmp(key, "require_attack") == 0)    { /* ignored */ }
 		else if (strcmp(key, "apply_to_bots") == 0)     g_Cfg.apply_to_bots = atoi(val);
@@ -202,6 +206,7 @@ static void SetDefaults() {
 	g_Cfg.punch_aim = 1.0f;
 	g_Cfg.recoil_scale = 0.8f;
 	g_Cfg.max_spread_deg = 10.0f;
+	g_Cfg.min_trace_len = 4096.0f;
 	g_Cfg.apply_to_bots = 1;
 	g_Cfg.debug = 1;
 	g_Cfg.enforce_cvars = 1;
@@ -218,6 +223,7 @@ static void ClampConfig() {
 	g_Cfg.punch_aim = clampf(g_Cfg.punch_aim, 0.0f, 1.0f);
 	g_Cfg.recoil_scale = clampf(g_Cfg.recoil_scale, 0.0f, 1.0f);
 	g_Cfg.max_spread_deg = clampf(g_Cfg.max_spread_deg, 2.0f, 30.0f);
+	g_Cfg.min_trace_len = clampf(g_Cfg.min_trace_len, 1000.0f, 8000.0f);
 	if (g_Cfg.unlag < 0.0f) g_Cfg.unlag = -1.0f;
 	if (g_Cfg.maxunlag < 0.0f) g_Cfg.maxunlag = -1.0f;
 	if (g_Cfg.unlagpush < 0.0f) g_Cfg.unlagpush = -1.0f;
@@ -348,23 +354,17 @@ static bool IsShotgun(edict_t *pl) {
    hook. If we react to it again we would double-scale spread or recurse. */
 static int g_InRecursion = 0;
 
-/* v2.1 bullet gate: |traceEnd - eye| must be within RANGE +/- tolerance.
-   In CS 1.6 FirePlayerBullet ALWAYS passes vecEnd = vecSrc + vecDir*RANGE
-   (RANGE = 8192 by default; sv_range overrides exist on some servers), even
-   when a wall blocks the bullet mid-flight - so every real bullet ends
-   exactly RANGE away from the lag-compensated firing spot, which sits within
-   ~100u of the current eye. The old fixed [7892,8592] band silently killed
-   every bullet on servers with a different sv_range (this is what produced
-   "not_bullet=everything, APPLIED=0" in the v1.9/v2.0 logs). Now the band is
-   derived from sv_range at runtime with a generous +/-600u margin. */
-#define SF_RANGE_DEFAULT 8192.0f
-#define SF_RANGE_TOL     600.0f
-
-static float GetRange() {
-	cvar_t *r = g_engfuncs.pfnCVarGetPointer("sv_range");
-	if (r && r->value > 100.0f) return r->value;
-	return SF_RANGE_DEFAULT;
-}
+/* v2.3 bullet gates (BOTH must pass):
+   GATE 1 (here, cheap): trace LENGTH >= min_trace_len (default 4096).
+     Real bullets always trace to start + dir*RANGE (~8192) even when blocked
+     by a wall, so they clear this easily. Knife hulls, step traces, tracer
+     effects and AMXX hitscan plugins are far shorter -> rejected here. This
+     fixes the v2.2 leak where ambient traces along the view axis were counted
+     as bullets (exact=14 APPLIED=0 while walking).
+   GATE 2 (below): direction inside the weapon spread cone around
+     AngleVectors(v_angle + punchangle*punch_aim). Stance/movement/lag-comp
+     proof, unlike the eye->end distance bands of v1.9-v2.1 which broke on
+     servers whose effective RANGE differs from any hardcoded band. */
 
 static void OnTraceLine(const float *v1, const float *v2, int fNoMonsters,
 						edict_t *skip, TraceResult *ptr) {
@@ -383,22 +383,10 @@ static void OnTraceLine(const float *v1, const float *v2, int fNoMonsters,
 	if ((fl & FL_FAKECLIENT) && !g_Cfg.apply_to_bots) { g_Cnt[2]++; return; }
 	if (skip->v.deadflag != DEAD_NO) { g_Cnt[2]++; return; }
 
-	/* ---- v2.1 bullet gate: |end - eye| within RANGE +/- 600u, RANGE read from
-	   sv_range at runtime (no hardcoded band -> works on any server config). */
-	float ex = skip->v.origin.x + skip->v.view_ofs.x;
-	float ey = skip->v.origin.y + skip->v.view_ofs.y;
-	float ez = skip->v.origin.z + skip->v.view_ofs.z;
-
-	float rng = GetRange();
-	float lo = rng - SF_RANGE_TOL, hi = rng + SF_RANGE_TOL;
-
-	float tx = v2[0] - ex, ty = v2[1] - ey, tz = v2[2] - ez;
-	float endLen = sqrtf(tx * tx + ty * ty + tz * tz);
-	if (endLen < lo || endLen > hi) { g_Cnt[3]++; return; }
-
+	/* ---- v2.3 GATE 1: length. Short traces are never bullets. */
 	float d[3] = { v2[0] - v1[0], v2[1] - v1[1], v2[2] - v1[2] };
 	float len2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
-	if (len2 < 1.0f) return;                 /* degenerate trace */
+	if (len2 < g_Cfg.min_trace_len * g_Cfg.min_trace_len) { g_Cnt[3]++; return; }
 	float len = sqrtf(len2);
 	float inv = 1.0f / len;
 	d[0] *= inv; d[1] *= inv; d[2] *= inv;
@@ -429,8 +417,9 @@ static void OnTraceLine(const float *v1, const float *v2, int fNoMonsters,
 	float dev[3] = { d[0] - fwd[0], d[1] - fwd[1], d[2] - fwd[2] };
 	float dl2 = dev[0] * dev[0] + dev[1] * dev[1] + dev[2] * dev[2];
 
-	g_LastLen = endLen;
-	g_LastDev = sqrtf(dl2);
+	g_LastLen = len;
+	/* chord between two unit vectors = 2*sin(theta/2) -> recover angle in deg */
+	g_LastAngDeg = 2.0f * asinf(clampf(sqrtf(dl2) * 0.5f, 0.0f, 1.0f)) * 57.29577951308232f;
 
 	if (dl2 < 1e-8f) { g_Cnt[4]++; return; }            /* zero spread: leave it */
 
@@ -540,10 +529,10 @@ static void OnStartFrame() {
 				if (delta[i] != 0) changed = true;
 			}
 			if (changed) {
-				ConPrint(SF_TAG " dbg(+3s): total=%u | botdead=%u not_bullet=%u exact=%u outside=%u APPLIED=%u"
-						 " | last: end=%.0f dev=%.4f\n",
+				ConPrint(SF_TAG " dbg(+3s): total=%u | botdead=%u short_tr=%u exact=%u outside=%u APPLIED=%u"
+						 " | last: len=%.0f ang=%.2fdeg\n",
 						 delta[0], delta[2], delta[3], delta[4], delta[5], delta[7],
-						 g_LastLen, g_LastDev);
+						 g_LastLen, g_LastAngDeg);
 				memcpy(g_CntPrev, g_Cnt, sizeof(g_Cnt));
 			}
 		}
@@ -643,7 +632,7 @@ C_DLLEXPORT int Meta_Attach(PLUG_LOADTIME now, META_FUNCTIONS *pFunctionTable,
 	ApplyCvars();
 	g_On = 1;
 
-	ConPrint(SF_TAG " v2.1 loaded (%s): spread=%.2f shotgun=%.2f punch_aim=%.2f recoil=%.2f debug=%d\n",
+	ConPrint(SF_TAG " v2.3 loaded (%s): spread=%.2f shotgun=%.2f punch_aim=%.2f recoil=%.2f debug=%d\n",
 			 found ? g_CfgPath : "no ini, defaults",
 			 g_Cfg.spread_scale, g_Cfg.shotgun_scale, g_Cfg.punch_aim, g_Cfg.recoil_scale, g_Cfg.debug);
 	return TRUE;
