@@ -20,7 +20,7 @@
 plugin_info_t Plugin_info = {
 	META_INTERFACE_VERSION,
 	"ShotFix",
-	"2.3",
+	"2.4",
 	__DATE__,
 	"FaTaL-[Hit]",
 	"https://t.me/Neo_Norm",
@@ -176,7 +176,7 @@ static void SetDefaults() {
 	g_Cfg.shotgun_scale = 0.85f;
 	g_Cfg.punch_aim = 1.0f;
 	g_Cfg.recoil_scale = 0.8f;
-	g_Cfg.max_spread_deg = 10.0f;
+	g_Cfg.max_spread_deg = 6.0f;
 	g_Cfg.min_trace_len = 4096.0f;
 	g_Cfg.apply_to_bots = 1;
 	g_Cfg.debug = 1;
@@ -203,12 +203,14 @@ static void ClampConfig() {
 }
 
 static bool LoadConfig(bool reload) {
-	SfSettings old = g_Cfg;
+	SfSettings oldCfg = g_Cfg;
+	char oldPath[256]; time_t oldMtime = g_CfgMtime;
+	memcpy(oldPath, g_CfgPath, sizeof(oldPath));
 	SetDefaults();
 
 	bool ok = false;
-	if (reload && g_CfgPath[0]) {
-		ok = try_load_config(g_CfgPath) != 0;
+	if (reload && oldPath[0]) {
+		ok = try_load_config(oldPath) != 0;
 	} else {
 		for (size_t i = 0; i < sizeof(g_Paths) / sizeof(g_Paths[0]); i++) {
 			if (try_load_config(g_Paths[i])) { ok = true; break; }
@@ -216,8 +218,9 @@ static bool LoadConfig(bool reload) {
 	}
 
 	if (!ok) {
-		if (reload) g_Cfg = old;
-		else ClampConfig();
+		g_Cfg = oldCfg;
+		memcpy(g_CfgPath, oldPath, sizeof(g_CfgPath));
+		g_CfgMtime = oldMtime;
 		return false;
 	}
 	ClampConfig();
@@ -438,11 +441,16 @@ static void OnPlayerPostThink_Post(edict_t *pl) {
 	float dx = cx - pre[0], dy = cy - pre[1], dz = cz - pre[2];
 
 	float dmag = dx * dx + dy * dy + dz * dz;
-	if (dmag < 1e-6f || dmag > 900.0f) return; /* no new kick / implausible jump */
+	if (dmag < 0.0001f || dmag > 900.0f) return; /* no new kick / implausible jump */
 
+	/* Skip pure decay: the game multiplies punch by ~0.875/frame when idle.
+	   A decay delta points toward zero from pre (dot < 0 AND |cur| < |pre|).
+	   Fresh kicks in any axis are scaled, so horizontal recoil matches the
+	   scaled bullet spread instead of fighting it. */
 	float pre2 = pre[0] * pre[0] + pre[1] * pre[1] + pre[2] * pre[2];
 	float cur2 = cx * cx + cy * cy + cz * cz;
-	if (cur2 <= pre2) return; /* decay: pass through untouched */
+	float dotd = dx * pre[0] + dy * pre[1] + dz * pre[2];
+	if (dotd < 0.0f && cur2 < pre2) return;
 
 	float s = g_Cfg.recoil_scale;
 	pl->v.punchangle.x = pre[0] + dx * s;
@@ -580,7 +588,7 @@ C_DLLEXPORT int Meta_Attach(PLUG_LOADTIME now, META_FUNCTIONS *pFunctionTable,
 	ApplyCvars();
 	g_On = 1;
 
-	ConPrint(SF_TAG " v2.3 loaded (%s): spread=%.2f shotgun=%.2f punch_aim=%.2f recoil=%.2f debug=%d\n",
+	ConPrint(SF_TAG " v2.4 loaded (%s): spread=%.2f shotgun=%.2f punch_aim=%.2f recoil=%.2f debug=%d\n",
 			 found ? g_CfgPath : "no ini, defaults",
 			 g_Cfg.spread_scale, g_Cfg.shotgun_scale, g_Cfg.punch_aim, g_Cfg.recoil_scale, g_Cfg.debug);
 	return TRUE;

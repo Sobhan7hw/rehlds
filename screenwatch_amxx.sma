@@ -7,7 +7,7 @@
 #include <amxmisc>
 
 #define PLUGIN "ScreenWatch Menu"
-#define VERSION "1.0"
+#define VERSION "1.1"
 #define AUTHOR "FaTaL-[Hit]"
 
 public plugin_init() {
