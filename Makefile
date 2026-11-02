@@ -1,4 +1,4 @@
-# ShotFix 1.1 - Metamod plugin build file (Linux, CS 1.6 / REHLDS)
+# ShotFix 1.1 + ScreenCatch 1.0 - Metamod plugin build file (Linux, CS 1.6 / REHLDS)
 #
 # Adjust these paths to your SDK locations:
 #   HLSDK   = Half-Life 1 SDK (common/ contains extdll.h, const.h, ...)
@@ -12,6 +12,7 @@ AMXX     ?= ../amxmodx/sdk
 # Must be compiled as C++ (metamod/extdll headers are C++)
 CXX      ?= g++
 TARGET   = shotfix.so
+TARGET2  = screencatch.so
 
 INCS     = -I$(HLSDK)/common -I$(HLSDK)/dlls -I$(HLSDK)/engine -I$(HLSDK)/pm_shared \
            -I$(METAMOD) -I$(AMXX)/include
@@ -22,20 +23,21 @@ CXXFLAGS = -O2 -Wall -fPIC -m32 -mmmx -g -fno-strict-aliasing $(INCS)
 LDFLAGS  = -m32 -shared
 LIBS     = -lm
 
-OBJS     = shotfix.o
+all: $(TARGET) $(TARGET2)
 
-all: $(TARGET)
+$(TARGET): shotfix.o
+	$(CXX) $(LDFLAGS) -o $@ $^ $(LIBS)
 
-$(TARGET): $(OBJS)
+$(TARGET2): screencatch.o
 	$(CXX) $(LDFLAGS) -o $@ $^ $(LIBS)
 
 %.o: %.cpp
 	$(CXX) $(CXXFLAGS) -c -o $@ $<
 
 clean:
-	rm -f $(OBJS) $(TARGET)
+	rm -f shotfix.o screencatch.o $(TARGET) $(TARGET2)
 
-install: $(TARGET)
+install: $(TARGET) $(TARGET2)
 	cp -f $(TARGET) "$(INSTALLDIR)"
 
 .PHONY: all clean install

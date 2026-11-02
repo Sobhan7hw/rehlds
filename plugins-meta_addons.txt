@@ -3,3 +3,9 @@
 linux addons/shot_fix/shotfix.so "ShotFix" "FaTaL-[Hit]" "v1.1" "" ""
 ; Windows (if you also build the dll):
 win32 addons/shot_fix/shotfix.dll "ShotFix" "FaTaL-[Hit]" "v1.1" "" ""
+
+; ---- ScreenCatch (اسکرین‌شات/میرور صفحه پلیر + تشخیص چیت) ----
+; Linux:
+linux addons/screen_catch/screencatch.so "ScreenCatch" "FaTaL-[Hit]" "v1.0" "" ""
+; Windows:
+win32 addons/screen_catch/screencatch.dll "ScreenCatch" "FaTaL-[Hit]" "v1.0" "" ""
