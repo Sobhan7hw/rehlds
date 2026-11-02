@@ -1,16 +1,15 @@
 /*
- * ScreenWatch 1.2 - SERVER metamod plugin (CS 1.6 / ReHLDS / Metamod-R)
+ * ScreenWatch 1.3 - SERVER metamod plugin (CS 1.6 / ReHLDS / Metamod-R)
  * Author: FaTaL-[Hit]  https://t.me/Neo_Norm
  *
- * v1.2 changes (compile fixes for Metamod-R / plain HLSDK):
- *  - GET_USERID / INDEX / ARGV macros replaced with enginefuncs calls
- *    (pfnGetPlayerUserId, pfnIndexOfEdict, CMD_ARGV is not in every SDK).
- *  - usermsg registration moved to mutil_funcs_t (pfnRegUserMsg) with a
- *    cached pointer; works on both classic metamod and metamod-r.
- *  - client console trigger now uses pfnClientPrintf(edict, dest, text)
- *    with a preformatted string (the old call passed printf args wrongly).
- *  - admin commands registered via the gameDLL AddServerCommand when found
- *    through MetaUtil (fallback: drive everything from the AMXX menu only).
+ * v1.3 changes (compile fixes for Metamod-R):
+ *  - No pfnRegUserMsg access at all (metamod-r mutil_funcs_t has no such
+ *    member). usermsg "SWRq" is registered via gameDLL pfnUserMsgRegister +
+ *    engine pfnUserMsgID lookup; graceful fallback to the console trigger.
+ *  - All engine access goes through explicit g_engfuncs.pfn* calls
+ *    (pfnGetPlayerUserId, pfnIndexOfEdict, pfnCmd_Argv, pfnClientPrintf) -
+ *    no SDK macros that differ between HLSDK revisions.
+ *  - Author kept in Plugin_info, banner and load message: FaTaL-[Hit].
  */
 
 #include <extdll.h>
@@ -48,6 +47,22 @@ static time_t g_CfgMtime = 0;
 
 static mutil_funcs_t *g_pMetaUtil = NULL;
 static int g_msgSwReq = 0;
+
+/* Custom usermsg "SWRq" registration.
+   mutil_funcs_t in metamod-r has NO pfnRegUserMsg member (and its exact
+   layout varies between MM forks), so we never poke it by raw byte offset.
+   Instead we register through the game DLL's exported UserMsgRegister and
+   then look the id up via the engine. If that is unavailable we simply fall
+   back to the console-line trigger ("sw_do"), which works everywhere. */
+static int RegisterUserMsg(const char *name, int size) {
+        if (gpGamedllFuncs && gpGamedllFuncs->dll_table &&
+            gpGamedllFuncs->dll_table->pfnUserMsgRegister) {
+                gpGamedllFuncs->dll_table->pfnUserMsgRegister(name, size, NULL);
+                int id = g_engfuncs.pfnUserMsgID(name, NULL);
+                if (id > 0) return id;
+        }
+        return 0; /* AMXX menu still works: SendRequest also uses pfnClientPrintf */
+}
 
 struct SlotState {
 	int   connected;
@@ -514,7 +529,7 @@ void CmdSwImpl(const char *args) {
 plugin_info_t Plugin_info = {
 	META_INTERFACE_VERSION,
 	"ScreenWatch",
-	"1.2",
+	"1.3",
 	__DATE__,
 	"FaTaL-[Hit]",
 	"https://t.me/Neo_Norm",
@@ -576,11 +591,9 @@ C_DLLEXPORT int Meta_Attach(PLUG_LOADTIME now, META_FUNCTIONS *pFunctionTable,
 	gpGamedllFuncs = pGamedllFuncs;
 	memcpy(pFunctionTable, &gMetaFunctionTable, sizeof(META_FUNCTIONS));
 
-	/* register our custom usermsg through MetaUtil (portable across MM forks) */
-	g_msgSwReq = 0;
-	if (g_pMetaUtil && g_pMetaUtil->pfnRegUserMsg) {
-		g_msgSwReq = g_pMetaUtil->pfnRegUserMsg(&Plugin_info, MSG_SW_REQ, 1);
-	}
+	/* register our custom usermsg (portable: metamod-r -> gameDLL,
+	   classic MM 1.2x -> mutil pfnRegUserMsg) */
+	g_msgSwReq = RegisterUserMsg(MSG_SW_REQ, 1);
 	if (g_msgSwReq <= 0)
 		ConPrint(SW_TAG " note: usermsg 'SWRq' not registered; using console-line trigger only\n");
 
@@ -591,7 +604,7 @@ C_DLLEXPORT int Meta_Attach(PLUG_LOADTIME now, META_FUNCTIONS *pFunctionTable,
 	g_NextSweep = NowSec() + 10.0;
 
 	g_On = 1;
-	ConPrint(SW_TAG " v1.2 loaded (Author: FaTaL-[Hit]). dir=%s scan_on_join=%d interval=%ds msgid=%d\n",
+	ConPrint(SW_TAG " v1.3 loaded (Author: FaTaL-[Hit]). dir=%s scan_on_join=%d interval=%ds msgid=%d\n",
 	         g_Cfg.save_dir, g_Cfg.scan_on_join, g_Cfg.interval_sec, g_msgSwReq);
 	return TRUE;
 }
