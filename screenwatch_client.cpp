@@ -1,5 +1,5 @@
 /*
- * ScreenWatch 1.3 - CLIENT module (Windows, CS 1.6)
+ * ScreenWatch 1.4 - CLIENT module (Windows, CS 1.6)
  * by FaTaL-[Hit] - https://t.me/Neo_Norm
  * Loaded via dll_load (revEmu etc.) or a server launcher. Player is notified
  * in-game and can opt out any time with "sw_off".
