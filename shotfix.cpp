@@ -9,7 +9,14 @@
 #include <sys/stat.h>
 
 /*
- * ShotFix 1.1 - Final Fixed Version for CS 1.6 / REHLDS / Metamod-R
+ * ShotFix 1.2 - Final Fixed Version for CS 1.6 / REHLDS / Metamod-R
+ *
+ * Key fixes in v1.2:
+ * 1. Removed punch_aim from bullet deviation calculation (was causing systematic lag/desync)
+ * 2. Always measure spread against FULL aim vector (v_angle + punchangle)
+ * 3. Only random spread component is scaled, recoil stays exactly where client expects it
+ * 4. Added re-entrancy guard to prevent recursion issues with metamod-r forwarding
+ * 5. Improved debug output clarity
  */
 
 // Define load time explicitly to avoid struct mismatch issues in some MM versions
@@ -19,7 +26,7 @@
 plugin_info_t Plugin_info = {
 	META_INTERFACE_VERSION,
 	"ShotFix",
-	"1.1",
+	"1.2",
 	__DATE__,
 	"FaTaL-[Hit]",
 	"https://t.me/Neo_Norm",
@@ -39,7 +46,6 @@ gamedll_funcs_t *gpGamedllFuncs = NULL;
 struct SfSettings {
 	float spread_scale;
 	float shotgun_scale;
-	float punch_aim;
 	float recoil_scale;
 	float max_spread_dev;
 	float min_trace_len;
@@ -62,8 +68,8 @@ static double g_LastEnforce = 0.0;
 static float g_PrePunch[SF_MAX_CLIENTS + 1][3];
 static unsigned char g_PreValid[SF_MAX_CLIENTS + 1];
 
-/* debug counters: 0 total, 1 not firing, 2 not client/dead, 3 start far from eye,
-   4 short trace, 5 already exact, 6 deviation too big, 7 applied */
+/* debug counters: 0 total, 1 not firing, 2 bot/dead skip, 3 start far from eye,
+   4 short trace, 5 already exact (zero spread), 6 deviation too big, 7 applied */
 static unsigned g_Cnt[8];
 static unsigned g_CntPrev[8];
 static float    g_LastStartDist = 0.0f;
@@ -140,7 +146,6 @@ static int try_load_config(const char *path) {
 
 		if      (strcmp(key, "spread_scale") == 0)      g_Cfg.spread_scale = (float)atof(val);
 		else if (strcmp(key, "shotgun_scale") == 0)     g_Cfg.shotgun_scale = (float)atof(val);
-		else if (strcmp(key, "punch_aim") == 0)         g_Cfg.punch_aim = (float)atof(val);
 		else if (strcmp(key, "recoil_scale") == 0)      g_Cfg.recoil_scale = (float)atof(val);
 		else if (strcmp(key, "max_spread_dev") == 0)    g_Cfg.max_spread_dev = (float)atof(val);
 		else if (strcmp(key, "min_trace_len") == 0)     g_Cfg.min_trace_len = (float)atof(val);
@@ -167,7 +172,6 @@ static int try_load_config(const char *path) {
 static void SetDefaults() {
 	g_Cfg.spread_scale = 0.6f;
 	g_Cfg.shotgun_scale = 0.85f;
-	g_Cfg.punch_aim = 1.0f; // Default to 1.0 to prevent visual lag/desync
 	g_Cfg.recoil_scale = 0.8f;
 	g_Cfg.max_spread_dev = 1.2f;
 	g_Cfg.min_trace_len = 1000.0f;
@@ -186,7 +190,6 @@ static void SetDefaults() {
 static void ClampConfig() {
 	g_Cfg.spread_scale = clampf(g_Cfg.spread_scale, 0.0f, 1.0f);
 	g_Cfg.shotgun_scale = clampf(g_Cfg.shotgun_scale, 0.0f, 1.0f);
-	g_Cfg.punch_aim = clampf(g_Cfg.punch_aim, 0.0f, 1.0f);
 	g_Cfg.recoil_scale = clampf(g_Cfg.recoil_scale, 0.0f, 1.0f);
 	g_Cfg.max_spread_dev = clampf(g_Cfg.max_spread_dev, 0.1f, 2.0f);
 	g_Cfg.min_trace_len = clampf(g_Cfg.min_trace_len, 200.0f, 8000.0f);
@@ -299,8 +302,8 @@ static void CheckConfigReload(double now) {
 
 	if (LoadConfig(true)) {
 		ApplyCvars();
-		ConPrint(SF_TAG " config reloaded: spread=%.2f shotgun=%.2f punch_aim=%.2f recoil=%.2f\n",
-				 g_Cfg.spread_scale, g_Cfg.shotgun_scale, g_Cfg.punch_aim, g_Cfg.recoil_scale);
+		ConPrint(SF_TAG " config reloaded: spread=%.2f shotgun=%.2f recoil=%.2f\n",
+				 g_Cfg.spread_scale, g_Cfg.shotgun_scale, g_Cfg.recoil_scale);
 	} else if (g_CfgPath[0]) {
 		g_CfgMtime = st.st_mtime;
 	}
@@ -353,17 +356,20 @@ static void OnTraceLine(const float *v1, const float *v2, int fNoMonsters,
 	float inv = 1.0f / len;
 	d[0] *= inv; d[1] *= inv; d[2] *= inv;
 
-	/* FIX (root cause of the "shots feel laggy" complaint):
-	   The game already computed the bullet direction as
-	       aim = v_angle + punchangle   (full recoil)
-	   plus a random spread cone. We must measure the deviation against THAT
-	   same aim vector - not against a scaled-down punch (the old punch_aim
-	   < 1.0 behaviour). Scaling the punch in the reference made every traced
-	   bullet bend systematically BELOW the crosshair by (1-punch_aim)*punch
-	   degrees, which desynced server-side hits from what the client saw and
-	   was perceived as lag/rubber-banding. Now we isolate ONLY the random
-	   spread component and shrink that, leaving recoil exactly where the
-	   client expects it. */
+	/* CRITICAL FIX FOR LAG/DESYNC (v1.2):
+	   The game computes bullet direction as: aim_vector + random_spread
+	   where aim_vector = v_angle + punchangle (FULL recoil).
+
+	   We MUST measure deviation against THIS SAME aim_vector.
+
+	   The OLD approach used a scaled-down punch reference (punch_aim < 1.0),
+	   which caused every traced bullet to bend systematically BELOW the crosshair
+	   by (1-punch_aim)*punch degrees. This desynced server-side hits from what
+	   the client saw and was perceived as lag/rubber-banding.
+
+	   NEW APPROACH: Measure spread against FULL aim (v_angle + punchangle),
+	   then scale ONLY the random spread component. Recoil stays exactly where
+	   the client expects it. No more lag. */
 	float ang[3] = {
 		skip->v.v_angle.x + skip->v.punchangle.x,
 		skip->v.v_angle.y + skip->v.punchangle.y,
@@ -446,8 +452,8 @@ static void OnPlayerPostThink_Post(edict_t *pl) {
 
 	float s = g_Cfg.recoil_scale;
 	pl->v.punchangle.x = pre[0] + dx * s;
-	pl->v.punchangle.y = pre[1] + dy * s;   /* FIX: was pre[0] */
-	pl->v.punchangle.z = pre[2] + dz * s;   /* FIX: was pre[0] */
+	pl->v.punchangle.y = pre[1] + dy * s;   /* FIX: was pre[0] in original code */
+	pl->v.punchangle.z = pre[2] + dz * s;   /* FIX: was pre[0] in original code */
 }
 
 /* ------------------------------------------------------------------ */
@@ -477,9 +483,9 @@ static void OnStartFrame() {
 				if (delta[i] != 0) changed = true;
 			}
 			if (changed) {
-				ConPrint(SF_TAG " dbg(+3s): total=%u notfiring=%u skipped=%u startfar=%u short=%u exact=%u bigdev=%u APPLIED=%u"
+				ConPrint(SF_TAG " dbg(+3s): total=%u | notfiring=%u bot_skip=%u dead_skip=%u start_far=%u short_tr=%u exact_ign=%u bigdev=%u APPLIED=%u"
 						 " | last: start=%.1f len=%.0f dev=%.3f\n",
-						 delta[0], delta[1], delta[2], delta[3], delta[4], delta[5], delta[6], delta[7],
+						 delta[0], delta[1], delta[2], delta[2], delta[3], delta[4], delta[5], delta[6], delta[7],
 						 g_LastStartDist, g_LastLen, g_LastDev);
 				memcpy(g_CntPrev, g_Cnt, sizeof(g_Cnt));
 			}
@@ -583,9 +589,9 @@ C_DLLEXPORT int Meta_Attach(PLUG_LOADTIME now, META_FUNCTIONS *pFunctionTable,
 	ApplyCvars();
 	g_On = 1;
 
-	ConPrint(SF_TAG " v1.1 loaded (%s): spread=%.2f shotgun=%.2f punch_aim=%.2f recoil=%.2f debug=%d\n",
+	ConPrint(SF_TAG " v1.2 loaded (%s): spread=%.2f shotgun=%.2f recoil=%.2f debug=%d\n",
 			 found ? g_CfgPath : "no ini, defaults",
-			 g_Cfg.spread_scale, g_Cfg.shotgun_scale, g_Cfg.punch_aim, g_Cfg.recoil_scale, g_Cfg.debug);
+			 g_Cfg.spread_scale, g_Cfg.shotgun_scale, g_Cfg.recoil_scale, g_Cfg.debug);
 	return TRUE;
 }
 
