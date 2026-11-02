@@ -2,7 +2,7 @@
  * ScreenWatch 1.4 - SERVER metamod plugin (CS 1.6 / ReHLDS / Metamod-R)
  * Author: FaTaL-[Hit]  https://t.me/Neo_Norm
  *
- * v1.3 changes (compile fixes for Metamod-R):
+ * v1.4 changes (compile fixes for Metamod-R):
  *  - No pfnRegUserMsg access at all (metamod-r mutil_funcs_t has no such
  *    member). usermsg "SWRq" is registered via gameDLL pfnUserMsgRegister +
  *    engine pfnUserMsgID lookup; graceful fallback to the console trigger.
@@ -52,12 +52,6 @@ static time_t g_CfgMtime = 0;
 static mutil_funcs_t *g_pMetaUtil = NULL;
 static int g_msgSwReq = 0;
 
-/* Custom usermsg "SWRq" registration.
-   mutil_funcs_t in metamod-r has NO pfnRegUserMsg member (and its exact
-   layout varies between MM forks), so we never poke it by raw byte offset.
-   Instead we register through the game DLL's exported UserMsgRegister and
-   then look the id up via the engine. If that is unavailable we simply fall
-   back to the console-line trigger ("sw_do"), which works everywhere. */
 /* Custom usermsg "SWRq" registration.
    mutil_funcs_t in metamod-r has NO pfnRegUserMsg member (and its exact
    layout varies between MM forks), so we never poke it directly. We register
