@@ -9,37 +9,8 @@
 #include <sys/stat.h>
 
 /*
- * ShotFix 2.3 - Hybrid angle+length bullet detection for CS 1.6 / REHLDS / Metamod-R
- *
- * Changelog vs v2.2 (console log analysis):
- *   v2.2 (pure angular cone test) worked but leaked: ambient traces that run
- *   along the player's view axis (knife-hull probes, AMXX visibility checks,
- *   tracer effects) also sit inside the cone window and were counted as
- *   bullets -> "exact=14 APPLIED=0" lines with ang=0.00 during idle walking,
- *   and inconsistent APPLIED counts during sprays.
- *
- *   v2.3 requires BOTH invariants of a real CS 1.6 bullet simultaneously:
- *     1) DIRECTION inside the weapon spread cone around
- *        AngleVectors(v_angle + punchangle*punch_aim)  (angular gate,
- *        max_spread_deg, x3 window for shotguns) - stance/lag-comp proof; AND
- *     2) LENGTH >= min_trace_len (default 4096, clampable 1000..8000) -
- *        kills all short ambient/knife/hitscan traces that passed gate 1.
- *   Real bullets trace at full RANGE (~8192) regardless of whether they hit a
- *   wall (the game passes vecEnd = start + dir*RANGE), so gate 2 never clips
- *   them even if sv_range is customized above ~4000. If your server runs an
- *   extremely low sv_range, lower min_trace_len in the ini.
- *
- *   Debug line now prints len=<trace length> ang=<deg off aim axis>.
- *   Healthy spray signature: APPLIED ~= bullets fired, outside small, exact
- *   only for the few zero-spread shots (first shot standing still).
- *
- *   Anti-lag core (unchanged since v1.5):
- *     Reference aim = pfnAngleVectors( v_angle + punchangle * punch_aim ),
- *     exactly matching CBasePlayer::FirePlayerBullet:
- *         vecDirShooting = AngleVectors(v_angle + punchangle);
- *         vecDir = RandomBend(vecDirShooting, inaccuracy);
- *     We scale ONLY the random-cone deviation (dev = d - fwd), never the punch
- *     itself, so bullets stay glued to the visible crosshair => no desync.
+ * ShotFix 2.4 - Spread/recoil fix for CS 1.6 / ReHLDS / Metamod-R
+ * by FaTaL-[Hit] - https://t.me/Neo_Norm
  */
 
 // Define load time explicitly to avoid struct mismatch issues in some MM versions
@@ -354,17 +325,7 @@ static bool IsShotgun(edict_t *pl) {
    hook. If we react to it again we would double-scale spread or recurse. */
 static int g_InRecursion = 0;
 
-/* v2.3 bullet gates (BOTH must pass):
-   GATE 1 (here, cheap): trace LENGTH >= min_trace_len (default 4096).
-     Real bullets always trace to start + dir*RANGE (~8192) even when blocked
-     by a wall, so they clear this easily. Knife hulls, step traces, tracer
-     effects and AMXX hitscan plugins are far shorter -> rejected here. This
-     fixes the v2.2 leak where ambient traces along the view axis were counted
-     as bullets (exact=14 APPLIED=0 while walking).
-   GATE 2 (below): direction inside the weapon spread cone around
-     AngleVectors(v_angle + punchangle*punch_aim). Stance/movement/lag-comp
-     proof, unlike the eye->end distance bands of v1.9-v2.1 which broke on
-     servers whose effective RANGE differs from any hardcoded band. */
+/* see README */
 
 static void OnTraceLine(const float *v1, const float *v2, int fNoMonsters,
 						edict_t *skip, TraceResult *ptr) {
@@ -391,20 +352,7 @@ static void OnTraceLine(const float *v1, const float *v2, int fNoMonsters,
 	float inv = 1.0f / len;
 	d[0] *= inv; d[1] *= inv; d[2] *= inv;
 
-	/* ================================================================
-	   AIM REFERENCE VECTOR (the anti-lag core, unchanged since v1.5):
-
-	   CS 1.6 CBasePlayer::FirePlayerBullet:
-		   vecDirShooting = AngleVectors(v_angle + punchangle)
-		   vecDir         = RandomBend(vecDirShooting, inaccuracy)
-	   The spread cone is centered on the PUNCH-AIMED vector, and the
-	   visible crosshair points the same way. So |dev| against
-	   AngleVectors(v_angle + punch*punch_aim) is purely the random cone.
-	   Scaling dev toward fwd tightens the cone symmetrically around where
-	   a zero-spread shot would go => bullets stay glued to the crosshair,
-	   server/client agree, no perceived lag. Roll (z) does not affect the
-	   forward vector, hence 0.
-	   ================================================================ */
+	/* see README */
 	float pa = g_Cfg.punch_aim;
 	float ang[3] = {
 		skip->v.v_angle.x + skip->v.punchangle.x * pa,

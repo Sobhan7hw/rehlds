@@ -1,33 +1,6 @@
 /*
- * ============================================================================
- *  ClientShot v1.0 - SERVER SIDE (metamod plugin, CS 1.6 / ReHLDS / revEmu)
- * ----------------------------------------------------------------------------
- *  HOW IT WORKS (read before using):
- *   The HL engine gives the server NO access to client RAM or screen. To get
- *   real screenshots we ship a companion CLIENT MODULE (clientshot_client.cpp,
- *   compiled as clientshot.dll) that is auto-downloaded to players like any
- *   other game file (sv_downloadurl / normal precache download). That module:
- *     - registers usermsg "CShRq" for scan requests from the server
- *     - takes a screenshot with GDI BitBlt -> downscaled 8-bit BMP in memory
- *     - lists running processes (CreateToolhelp32Snapshot)
- *     - sends results back via client commands: cs_hwid / cs_proclist /
- *       cs_shot_begin / cs_shot_chunk(hex) / cs_shot_end
- *   This plugin receives those commands (hooked pfnClientCommand), reassembles
- *   chunks, saves the BMP under cstrike/clientshot/ and flags watchlist hits.
- *
- *  HONEST LIMITATIONS:
- *   - A cheater who blocks/removes the downloaded dll never answers; you see
- *     TIMEOUT in console (that itself is suspicious). Treat output as EVIDENCE
- *     FOR REVIEW, not automatic ban material.
- *   - Hex-over-clientcommand is slow for big images; keep max_shot_kb modest.
- *   - Legality: scanning a user's machine requires disclosure + consent text
- *     on your site/server MOTD. Do NOT distribute this silently.
- *
- *  ADMIN USAGE (server console or RCON):
- *     clientshot_shot <userid>   request screenshot+process list now
- *     clientshot_proc <userid>   request process list only
- *     clientshot_list            show which slots answered (module present?)
- * ============================================================================
+ * ClientShot 1.0 - SERVER metamod plugin (CS 1.6 / ReHLDS / revEmu)
+ * by FaTaL-[Hit] - https://t.me/Neo_Norm
  */
 
 #include <extdll.h>

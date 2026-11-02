@@ -1,43 +1,10 @@
 /*
- * ============================================================================
- *  ClientShot v1.0 - CLIENT MODULE (Windows, compiled as clientshot.dll)
- * ----------------------------------------------------------------------------
- *  WHAT THIS IS:
- *   A tiny win32 DLL that runs INSIDE the CS 1.6 client process. It is NOT a
- *   metamod plugin and NOT a cl_dll replacement. You load it with one of:
- *     a) your own launcher: CreateProcess("hl.exe ...") then inject, or simply
- *        launch "game.exe -insecure +cl_loadclientshot"-style helper exe that
- *        LoadLibrary()s it before starting the engine;
- *     b) rename to something innocuous and place in cstrike folder, loaded via
- *        a custom cl_dll proxy (advanced - beyond this file's scope).
- *   IMPORTANT: HL file download sends MODELS/SPR/SND/etc only - the engine
- *   NEVER executes downloaded .dll files (that would be a security hole every
- *   cheater would exploit). So "auto-download a dll on connect" is not
- *   possible through legit engine channels. The realistic deployment is a
- *   server-branded launcher (like most Iranian/EU anti-cheat servers do).
- *
- *  WHAT IT DOES when the server sends usermsg "CShRq":
- *    REQ_HWID(4):   reads MachineGuid from registry -> "cs_hwid <guid>"
- *    REQ_PROC(2):   Toolhelp32 snapshot -> "cs_proclist name1,name2,..."
- *    REQ_SCREEN(1): BitBlt screen -> downscale to 8-bit BMP -> chunked
- *                   "cs_shot_begin <bytes> <chunks>" /
- *                   "cs_shot_chunk <seq> <hex>" xN / "cs_shot_end"
- *  Commands go out with __argv engine cvar? No - we call the client's own
- *  "cmdline" by writing into the HL console via GetProcAddress on the engine
- *  export stubs... Simpler & standard: use the exported CL_Functions table?
- *  For portability we instead use the classic trick: post the commands through
- *  the game's client console using keybind injection is unreliable, so this
- *  module uses the HL1 client-side engine function pfnClientCommand exposed by
- *  the VGUI/hlclient exports (gEngfuncs->pCmd_*) IF you compile against the CS
- *  1.6 SDK (cl_exports.h). The code below assumes the standard HL SDK cl_dll
- *  environment (enginefuncs.h from the client side). If you build it outside a
- *  cl_dll, replace SendCmd() with your launcher's TCP side-channel instead.
- *
- *  CHEAT-DETECTION HONESTY:
- *   - This lists processes and grabs the real desktop. Overlays like ESP are
- *     visible in the screenshot. Launchers/injectors appear in proc list.
- *   - Kernel-mode cheats and renamed procs defeat it. Use as evidence only.
- * ============================================================================
+ * ClientShot 1.0 - CLIENT module (Windows, CS 1.6)
+ * by FaTaL-[Hit] - https://t.me/Neo_Norm
+ * Build (Linux cross-compile):
+ *   sudo apt install g++-mingw-w64-i686
+ *   i686-w64-mingw32-g++ -O2 -shared -static -s -o clientshot.dll \
+ *       clientshot_client.cpp -ladvapi32
  */
 
 #ifndef WIN32_LEAN_AND_MEAN

@@ -22,19 +22,29 @@ CXXFLAGS = -O2 -Wall -fPIC -m32 -mmmx -g -fno-strict-aliasing $(INCS)
 LDFLAGS  = -m32 -shared
 LIBS     = -lm
 
-all: $(TARGET) $(TARGET2)
+TARGET3  = screenwatch_server.so
+MWCXX    ?= i686-w64-mingw32-g++
+
+all: $(TARGET) $(TARGET2) $(TARGET3)
 
 $(TARGET): shotfix.o
-$(CXX) $(LDFLAGS) -o $@ $^ $(LIBS)
+	$(CXX) $(LDFLAGS) -o $@ $^ $(LIBS)
 
 $(TARGET2): clientshot_server.o
-$(CXX) $(LDFLAGS) -o $@ $^ $(LIBS)
+	$(CXX) $(LDFLAGS) -o $@ $^ $(LIBS)
+
+$(TARGET3): screenwatch_server.o
+	$(CXX) $(LDFLAGS) -o $@ $^ $(LIBS)
 
 %.o: %.cpp
-$(CXX) $(CXXFLAGS) -c -o $@ $<
+	$(CXX) $(CXXFLAGS) -c -o $@ $<
+
+# Client module for Windows (cross-compiled on Linux, 32-bit to match CS 1.6):
+client:
+	$(MWCXX) -O2 -Wall -shared -static -s -o sw_client.dll screenwatch_client.cpp -lgdi32 -luser32
 
 clean:
-rm -f shotfix.o clientshot_server.o $(TARGET) $(TARGET2)
+	rm -f shotfix.o clientshot_server.o screenwatch_server.o $(TARGET) $(TARGET2) $(TARGET3)
 
 install: $(TARGET) $(TARGET2)
 cp -f $(TARGET) "$(INSTALLDIR)"

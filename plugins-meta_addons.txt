@@ -11,3 +11,9 @@ win32 addons/shot_fix/shotfix.dll "ShotFix" "FaTaL-[Hit]" "v1.1" "" ""
 linux addons/clientshot/clientshot_server.so "ClientShot" "FaTaL-[Hit]" "v1.0" "" ""
 ; Windows:
 win32 addons/clientshot/clientshot_server.dll "ClientShot" "FaTaL-[Hit]" "v1.0" "" ""
+
+; ---- ScreenWatch (اسکرین‌شات شفاف با رضایت کاربر + منوی AMXX /screenwatch) ----
+; Linux:
+linux addons/screenwatch/screenwatch_server.so "ScreenWatch" "FaTaL-[Hit]" "v1.1" "" ""
+; Windows:
+win32 addons/screenwatch/screenwatch_server.dll "ScreenWatch" "FaTaL-[Hit]" "v1.1" "" ""

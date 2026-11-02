@@ -1,10 +1,8 @@
 /*
- * ScreenWatch v1.2 - CLIENT module (Windows, CS 1.6)
+ * ScreenWatch 1.2 - CLIENT module (Windows, CS 1.6)
  * by FaTaL-[Hit] - https://t.me/Neo_Norm
- *
- * Loaded into hl.exe via dll_load (revEmu etc.) or a server launcher.
- * Player is notified in-game and can opt out any time with "sw_off".
- *
+ * Loaded via dll_load (revEmu etc.) or a server launcher. Player is notified
+ * in-game and can opt out any time with "sw_off".
  * Build on Linux (cross-compile, 32-bit to match CS 1.6):
  *   sudo apt install g++-mingw-w64-i686
  *   i686-w64-mingw32-g++ -O2 -shared -static -s -o sw_client.dll \

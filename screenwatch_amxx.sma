@@ -1,7 +1,6 @@
 /*
- * ScreenWatch Admin Menu v1.0 - AMXX plugin by FaTaL-[Hit] - https://t.me/Neo_Norm
- * /screenwatch -> menu to shoot / list windows+procs / module status / watchlist,
- * powered by the "ScreenWatch" metamod plugin (sw_shot, sw_win, sw_full, sw_list, sw_watch).
+ * ScreenWatch Admin Menu v1.1 - AMXX plugin
+ * by FaTaL-[Hit] - https://t.me/Neo_Norm
  */
 
 #include <amxmodx>

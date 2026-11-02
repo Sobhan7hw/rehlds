@@ -1,15 +1,6 @@
 /*
- * ScreenWatch v1.1 - SERVER side metamod plugin (CS 1.6 / ReHLDS / revEmu)
+ * ScreenWatch 1.1 - SERVER metamod plugin (CS 1.6 / ReHLDS / revEmu)
  * by FaTaL-[Hit] - https://t.me/Neo_Norm
- *
- * Pairs with sw_client.dll. Flow: client announces "sw_ready", server requests
- * scans via usermsg "SWRq" (or console broadcast "sw_do <flags>" as fallback),
- * client replies with sw_windows / sw_procs / sw_shot_begin|_chunk|_end chunks.
- * Server rebuilds BMP into save_dir and matches names against the watchlist.
- * Output is evidence for manual review, never an automatic ban.
- *
- * Admin: sw_shot|sw_win|sw_full <userid|name> | sw_list | sw_watch [add <pat>]
- * Build: make screenwatch_server.so   (see Makefile)
  */
 
 #include <extdll.h>
