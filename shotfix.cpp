@@ -9,22 +9,26 @@
 #include <sys/stat.h>
 
 /*
- * ShotFix 1.9 - Eye-referenced RANGE-band bullet detection for CS 1.6 / REHLDS / Metamod-R
+ * ShotFix 2.1 - Runtime RANGE-band bullet detection for CS 1.6 / REHLDS / Metamod-R
  *
- * Changelog vs v1.8 (console log analysis):
- *   v1.8 logs showed APPLIED working during sprays (len=8192, dev~0.005-0.06)
- *   BUT a huge number of traces fell into "not_bullet" even while the player
- *   was firing single shots: many real bullets measure len(v2-v1) slightly
- *   outside [7892,8592] because the game builds the shot as
- *       start = eye position (origin + view_ofs, lag-compensated)
- *       end   = start + vecDir * RANGE
- *   and on some frames the stored origin/view_ofs used by other systems make
- *   |v2-v1| drift out of the band. The robust invariant is NOT the trace's
- *   own length but the distance from the PLAYER EYE to the trace ENDPOINT:
- *   that equals RANGE (8192) for every fired bullet regardless of stance,
- *   crouch transitions or movement. v1.9 measures |v2 - (origin+view_ofs)|
- *   against the same +/-300u band. Upper bound still rejects infinite/hull
- *   rays (noclip tests, AMXX TR_TraceHullF with huge endpoints).
+ * Changelog vs v1.9 (console log analysis):
+ *   v1.9 logs showed the RANGE band working ONLY when sv_range was exactly
+ *   8192; on this server most bullets fell into "not_bullet" while spraying,
+ *   i.e. the hardcoded [7892,8592] band does not match every server's actual
+ *   bullet RANGE (sv_range can be overridden; ReHLDS/replay tooling and some
+ *   configs change it). A fixed band is therefore the wrong invariant.
+ *
+ *   v2.1 reads sv_range at runtime and gates on:
+ *        |traceEnd - eye| within [RANGE-600, RANGE+600]
+ *   This keeps the two properties that made v1.9 robust:
+ *     - measured from the EYE (origin+view_ofs), so stance/crouch/movement
+ *       and lag-comp start-point drift do NOT matter;
+ *     - endpoint distance, so knife hulls / step traces / tracer effects /
+ *       AMXX hitscan (which end far closer than RANGE) are rejected cleanly.
+ *   If sv_range is missing or absurd (<100), default 8192 is used.
+ *
+ *   Debug line now prints end=<eye->end distance> so you can SEE the server's
+ *   real RANGE in one spray.
  *
  *   Anti-lag core (unchanged since v1.5):
  *     Reference aim = pfnAngleVectors( v_angle + punchangle * punch_aim ),
@@ -42,7 +46,7 @@
 plugin_info_t Plugin_info = {
 	META_INTERFACE_VERSION,
 	"ShotFix",
-	"1.9",
+	"2.1",
 	__DATE__,
 	"FaTaL-[Hit]",
 	"https://t.me/Neo_Norm",
@@ -344,14 +348,23 @@ static bool IsShotgun(edict_t *pl) {
    hook. If we react to it again we would double-scale spread or recurse. */
 static int g_InRecursion = 0;
 
-/* Bullet RANGE band (v1.9), measured from the player EYE to the trace END.
-   FirePlayerBullet always sends end = start + dir*RANGE with RANGE=8192
-   (sv_range), whether or not a wall blocked the bullet mid-flight. +/-300u
-   covers nonstandard sv_range and floating noise. Knife hulls, step traces,
-   tracer effects and AMXX hitscan calls have their endpoint nowhere near
-   8192 units from the shooter's eye -> rejected cleanly. */
-#define SF_BULLET_MIN_LEN 7892.0f
-#define SF_BULLET_MAX_LEN 8592.0f
+/* v2.1 bullet gate: |traceEnd - eye| must be within RANGE +/- tolerance.
+   In CS 1.6 FirePlayerBullet ALWAYS passes vecEnd = vecSrc + vecDir*RANGE
+   (RANGE = 8192 by default; sv_range overrides exist on some servers), even
+   when a wall blocks the bullet mid-flight - so every real bullet ends
+   exactly RANGE away from the lag-compensated firing spot, which sits within
+   ~100u of the current eye. The old fixed [7892,8592] band silently killed
+   every bullet on servers with a different sv_range (this is what produced
+   "not_bullet=everything, APPLIED=0" in the v1.9/v2.0 logs). Now the band is
+   derived from sv_range at runtime with a generous +/-600u margin. */
+#define SF_RANGE_DEFAULT 8192.0f
+#define SF_RANGE_TOL     600.0f
+
+static float GetRange() {
+	cvar_t *r = g_engfuncs.pfnCVarGetPointer("sv_range");
+	if (r && r->value > 100.0f) return r->value;
+	return SF_RANGE_DEFAULT;
+}
 
 static void OnTraceLine(const float *v1, const float *v2, int fNoMonsters,
 						edict_t *skip, TraceResult *ptr) {
@@ -370,21 +383,18 @@ static void OnTraceLine(const float *v1, const float *v2, int fNoMonsters,
 	if ((fl & FL_FAKECLIENT) && !g_Cfg.apply_to_bots) { g_Cnt[2]++; return; }
 	if (skip->v.deadflag != DEAD_NO) { g_Cnt[2]++; return; }
 
-	/* ---- v1.9 bullet gate: |v2 - eye| within the RANGE band.
-	   Independent of stance/crouch/movement (the failure mode of v1.8 which
-	   measured |v2-v1| and lost real bullets whose start point drifted). */
-	/* Bullet start must be near the eye (lag-comp moves it along the view ray,
-	   never sideways): this cheap pre-filter rejects hulls/effects before we
-	   even measure the RANGE band. */
+	/* ---- v2.1 bullet gate: |end - eye| within RANGE +/- 600u, RANGE read from
+	   sv_range at runtime (no hardcoded band -> works on any server config). */
 	float ex = skip->v.origin.x + skip->v.view_ofs.x;
 	float ey = skip->v.origin.y + skip->v.view_ofs.y;
 	float ez = skip->v.origin.z + skip->v.view_ofs.z;
-	float ux = v1[0] - ex, uy = v1[1] - ey, uz = v1[2] - ez;
-	if (ux * ux + uy * uy + uz * uz > 400.0f * 400.0f) { g_Cnt[3]++; return; }
+
+	float rng = GetRange();
+	float lo = rng - SF_RANGE_TOL, hi = rng + SF_RANGE_TOL;
 
 	float tx = v2[0] - ex, ty = v2[1] - ey, tz = v2[2] - ez;
 	float endLen = sqrtf(tx * tx + ty * ty + tz * tz);
-	if (endLen < SF_BULLET_MIN_LEN || endLen > SF_BULLET_MAX_LEN) { g_Cnt[3]++; return; }
+	if (endLen < lo || endLen > hi) { g_Cnt[3]++; return; }
 
 	float d[3] = { v2[0] - v1[0], v2[1] - v1[1], v2[2] - v1[2] };
 	float len2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
@@ -419,7 +429,7 @@ static void OnTraceLine(const float *v1, const float *v2, int fNoMonsters,
 	float dev[3] = { d[0] - fwd[0], d[1] - fwd[1], d[2] - fwd[2] };
 	float dl2 = dev[0] * dev[0] + dev[1] * dev[1] + dev[2] * dev[2];
 
-	g_LastLen = len;
+	g_LastLen = endLen;
 	g_LastDev = sqrtf(dl2);
 
 	if (dl2 < 1e-8f) { g_Cnt[4]++; return; }            /* zero spread: leave it */
@@ -531,7 +541,7 @@ static void OnStartFrame() {
 			}
 			if (changed) {
 				ConPrint(SF_TAG " dbg(+3s): total=%u | botdead=%u not_bullet=%u exact=%u outside=%u APPLIED=%u"
-						 " | last: len=%.0f dev=%.4f\n",
+						 " | last: end=%.0f dev=%.4f\n",
 						 delta[0], delta[2], delta[3], delta[4], delta[5], delta[7],
 						 g_LastLen, g_LastDev);
 				memcpy(g_CntPrev, g_Cnt, sizeof(g_Cnt));
@@ -633,7 +643,7 @@ C_DLLEXPORT int Meta_Attach(PLUG_LOADTIME now, META_FUNCTIONS *pFunctionTable,
 	ApplyCvars();
 	g_On = 1;
 
-	ConPrint(SF_TAG " v1.9 loaded (%s): spread=%.2f shotgun=%.2f punch_aim=%.2f recoil=%.2f debug=%d\n",
+	ConPrint(SF_TAG " v2.1 loaded (%s): spread=%.2f shotgun=%.2f punch_aim=%.2f recoil=%.2f debug=%d\n",
 			 found ? g_CfgPath : "no ini, defaults",
 			 g_Cfg.spread_scale, g_Cfg.shotgun_scale, g_Cfg.punch_aim, g_Cfg.recoil_scale, g_Cfg.debug);
 	return TRUE;
