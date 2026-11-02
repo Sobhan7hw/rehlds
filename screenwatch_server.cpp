@@ -1,5 +1,5 @@
 /*
- * ScreenWatch 1.3 - SERVER metamod plugin (CS 1.6 / ReHLDS / Metamod-R)
+ * ScreenWatch 1.4 - SERVER metamod plugin (CS 1.6 / ReHLDS / Metamod-R)
  * Author: FaTaL-[Hit]  https://t.me/Neo_Norm
  *
  * v1.3 changes (compile fixes for Metamod-R):
@@ -22,6 +22,10 @@
 #include <time.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+
+#ifndef HUD_PRINTCONSOLE
+#define HUD_PRINTCONSOLE 2   /* enginefuncs pfnClientPrintf dest */
+#endif
 
 #define SW_TAG "[SW]"
 #define SW_MAX_CLIENTS 32
@@ -54,15 +58,22 @@ static int g_msgSwReq = 0;
    Instead we register through the game DLL's exported UserMsgRegister and
    then look the id up via the engine. If that is unavailable we simply fall
    back to the console-line trigger ("sw_do"), which works everywhere. */
+/* Custom usermsg "SWRq" registration.
+   mutil_funcs_t in metamod-r has NO pfnRegUserMsg member (and its exact
+   layout varies between MM forks), so we never poke it directly. We register
+   through the game DLL's exported UserMsgRegister and look the id up via the
+   engine. If that is unavailable we fall back to the console-line trigger
+   ("sw_do"), which works everywhere. */
 static int RegisterUserMsg(const char *name, int size) {
-        if (gpGamedllFuncs && gpGamedllFuncs->dll_table &&
-            gpGamedllFuncs->dll_table->pfnUserMsgRegister) {
-                gpGamedllFuncs->dll_table->pfnUserMsgRegister(name, size, NULL);
-                int id = g_engfuncs.pfnUserMsgID(name, NULL);
-                if (id > 0) return id;
-        }
-        return 0; /* AMXX menu still works: SendRequest also uses pfnClientPrintf */
+if (gpGamedllFuncs && gpGamedllFuncs->dll_table &&
+    gpGamedllFuncs->dll_table->pfnUserMsgRegister) {
+gpGamedllFuncs->dll_table->pfnUserMsgRegister(name, size, NULL);
+int id = g_engfuncs.pfnUserMsgID(name, NULL);
+if (id > 0) return id;
 }
+return 0; /* AMXX menu still works: SendRequest also uses pfnClientPrintf */
+}
+
 
 struct SlotState {
 	int   connected;
@@ -274,7 +285,7 @@ static void SendRequest(int idx, int flags) {
 	   console; screenwatch.cfg aliases sw_do to the client module export. */
 	char txt[64];
 	snprintf(txt, sizeof(txt), "\nsw_do %d\n", flags);
-	g_engfuncs.pfnClientPrintf(e, print_console, txt);
+	g_engfuncs.pfnClientPrintf(e, HUD_PRINTCONSOLE, txt);
 
 	if (g_Cfg.debug) ConPrint(SW_TAG " -> req flags=%d slot=%d\n", flags, idx);
 }
@@ -342,6 +353,8 @@ static void OnShotEnd(int idx) {
 static int SwArgc() { return g_engfuncs.pfnCmd_Argc(); }
 static const char *SwArgv(int n) { return g_engfuncs.pfnCmd_Argv(n); }
 
+void CmdSwImpl(const char *args);
+
 static void HandleClientCmd(edict_t *pl) {
 	if (!g_On || !pl) return;
 	int idx = IdxOf(pl);
@@ -398,7 +411,6 @@ static void HandleClientCmd(edict_t *pl) {
 		int need = snprintf(full, sizeof(full), "%s", c);
 		for (int i = 1; i < SwArgc() && need < (int)sizeof(full) - 1; i++)
 			need += snprintf(full + need, sizeof(full) - need, " %s", SwArgv(i));
-		extern void CmdSwImpl(const char *args);
 		CmdSwImpl(full);
 	}
 }
@@ -529,7 +541,7 @@ void CmdSwImpl(const char *args) {
 plugin_info_t Plugin_info = {
 	META_INTERFACE_VERSION,
 	"ScreenWatch",
-	"1.3",
+	"1.4",
 	__DATE__,
 	"FaTaL-[Hit]",
 	"https://t.me/Neo_Norm",
@@ -604,7 +616,7 @@ C_DLLEXPORT int Meta_Attach(PLUG_LOADTIME now, META_FUNCTIONS *pFunctionTable,
 	g_NextSweep = NowSec() + 10.0;
 
 	g_On = 1;
-	ConPrint(SW_TAG " v1.3 loaded (Author: FaTaL-[Hit]). dir=%s scan_on_join=%d interval=%ds msgid=%d\n",
+	ConPrint(SW_TAG " v1.4 loaded (Author: FaTaL-[Hit]). dir=%s scan_on_join=%d interval=%ds msgid=%d\n",
 	         g_Cfg.save_dir, g_Cfg.scan_on_join, g_Cfg.interval_sec, g_msgSwReq);
 	return TRUE;
 }

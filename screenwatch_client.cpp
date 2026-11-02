@@ -139,8 +139,9 @@ size_t rd = fread(raw, 1, SW_CHUNK_BYTES, f);
 hex[0] = 0;
 for (size_t j = 0; j < rd; j++) sprintf(hex + j * 2, "%02X", raw[j]);
 size_t pos = 0;
-while (pos < strlen(hex)) {
-size_t take = strlen(hex) - pos; if (take > 700) take = 700;
+size_t hexlen = strlen(hex);
+while (pos < hexlen) {
+size_t take = hexlen - pos; if (take > 700) take = 700;
 char part[720]; memcpy(part, hex + pos, take); part[take] = 0;
 SwCmd("%s_chunk %d %s", cmdPrefix, i, part);
 pos += take;
