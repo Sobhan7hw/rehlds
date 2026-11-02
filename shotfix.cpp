@@ -36,9 +36,9 @@ plugin_info_t Plugin_info = {
 	PT_STARTUP
 };
 
-/* Plugin's supported load window: attach only at/before PT_STARTUP, detach anytime. */
+/* Plugin's supported load window: attach only at/before PT_STARTUP (metamod-r's
+   plugin_info_t has no unload member, so we gate the attach time ourselves). */
 #define SF_LOAD_TIME PT_STARTUP
-#define SF_UNLOAD_TIME PT_ANYTIME
 
 enginefuncs_t g_engfuncs;
 globalvars_t *gpGlobals = NULL;
