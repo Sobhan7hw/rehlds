@@ -1,6 +1,16 @@
 /*
- * ScreenWatch 1.1 - SERVER metamod plugin (CS 1.6 / ReHLDS / revEmu)
- * by FaTaL-[Hit] - https://t.me/Neo_Norm
+ * ScreenWatch 1.2 - SERVER metamod plugin (CS 1.6 / ReHLDS / Metamod-R)
+ * Author: FaTaL-[Hit]  https://t.me/Neo_Norm
+ *
+ * v1.2 changes (compile fixes for Metamod-R / plain HLSDK):
+ *  - GET_USERID / INDEX / ARGV macros replaced with enginefuncs calls
+ *    (pfnGetPlayerUserId, pfnIndexOfEdict, CMD_ARGV is not in every SDK).
+ *  - usermsg registration moved to mutil_funcs_t (pfnRegUserMsg) with a
+ *    cached pointer; works on both classic metamod and metamod-r.
+ *  - client console trigger now uses pfnClientPrintf(edict, dest, text)
+ *    with a preformatted string (the old call passed printf args wrongly).
+ *  - admin commands registered via the gameDLL AddServerCommand when found
+ *    through MetaUtil (fallback: drive everything from the AMXX menu only).
  */
 
 #include <extdll.h>
@@ -23,10 +33,10 @@ enum { REQ_WINPROC = 1, REQ_SCREENSHOT = 2 };
 
 struct SwCfg {
 	int   scan_on_join;
-	int   interval_sec;         /* periodic sweep; 0 = off */
+	int   interval_sec;
 	int   max_shot_kb;
 	char  save_dir[256];
-	char  watchlist[1024];      /* ";" separated lowercase substrings */
+	char  watchlist[1024];
 	int   debug;
 } g_Cfg;
 
@@ -36,11 +46,14 @@ static double g_NextSweep = 0.0;
 static char   g_CfgPath[256] = "";
 static time_t g_CfgMtime = 0;
 
+static mutil_funcs_t *g_pMetaUtil = NULL;
+static int g_msgSwReq = 0;
+
 struct SlotState {
 	int   connected;
-	float joinTime;             /* gpGlobals->time at connect; -1 => reported */
+	float joinTime;
 	int   hasModule;
-	int   optOut;               /* player withdrew consent via sw_off */
+	int   optOut;
 	double lastReadyAt;
 	unsigned char *buf;
 	size_t bufCap;
@@ -48,6 +61,11 @@ struct SlotState {
 	int   chunksGot, chunksExpected;
 };
 static SlotState g_Slot[SW_MAX_CLIENTS + 1];
+
+enginefuncs_t g_engfuncs;
+globalvars_t *gpGlobals = NULL;
+meta_globals_t *gpMetaGlobals = NULL;
+gamedll_funcs_t *gpGamedllFuncs = NULL;
 
 /* ------------------------------------------------------------------ */
 /* Helpers                                                            */
@@ -74,6 +92,22 @@ static void trim(char *s) {
 }
 
 static void lowerstr(char *s) { for (; *s; s++) *s = (char)tolower((unsigned char)*s); }
+
+static edict_t *EdictOf(int idx) {
+	if (idx < 1 || idx > gpGlobals->maxClients) return NULL;
+	edict_t *e = g_engfuncs.pfnPEntityOfEntIndex(idx);
+	if (!e || e == g_engfuncs.pfnPEntityOfEntIndex(0)) return NULL;
+	return e;
+}
+
+static int IdxOf(edict_t *e) {
+	if (!e) return 0;
+	return g_engfuncs.pfnIndexOfEdict(e);
+}
+
+static int UserIdOf(edict_t *e) {
+	return g_engfuncs.pfnGetPlayerUserId(e);
+}
 
 /* ------------------------------------------------------------------ */
 /* Config                                                             */
@@ -178,28 +212,27 @@ static int WatchlistHit(const char *namesLower) {
 /* ------------------------------------------------------------------ */
 
 static edict_t *FindPlayer(const char *arg) {
+	if (!arg || !arg[0]) return NULL;
 	/* "#N" means entity slot index directly (used by the AMXX menu) */
 	if (arg[0] == '#' && isdigit((unsigned char)arg[1])) {
 		int slot = atoi(arg + 1);
-		if (slot >= 1 && slot <= gpGlobals->maxClients) {
-			edict_t *e = INDEXENT(slot);
-			if (e && !FNullEnt(e) && (e->v.flags & FL_CLIENT)) return e;
-		}
+		edict_t *e = EdictOf(slot);
+		if (e && (e->v.flags & FL_CLIENT)) return e;
 		return NULL;
 	}
 	int uid = atoi(arg);
 	if (uid > 0) {
 		for (int i = 1; i <= gpGlobals->maxClients; i++) {
-			edict_t *e = INDEXENT(i);
-			if (e && !FNullEnt(e) && (e->v.flags & FL_CLIENT) && !(e->v.flags & FL_FAKECLIENT))
-				if (GET_USERID(e) == uid) return e;
+			edict_t *e = EdictOf(i);
+			if (e && (e->v.flags & FL_CLIENT) && !(e->v.flags & FL_FAKECLIENT))
+				if (UserIdOf(e) == uid) return e;
 		}
 		return NULL;
 	}
 	char low[64]; strncpy(low, arg, 63); low[63] = 0; lowerstr(low);
 	for (int i = 1; i <= gpGlobals->maxClients; i++) {
-		edict_t *e = INDEXENT(i);
-		if (e && !FNullEnt(e) && (e->v.flags & FL_CLIENT) && !(e->v.flags & FL_FAKECLIENT)) {
+		edict_t *e = EdictOf(i);
+		if (e && (e->v.flags & FL_CLIENT) && !(e->v.flags & FL_FAKECLIENT)) {
 			char nm[64]; strncpy(nm, STRING(e->v.netname), 63); nm[63] = 0; lowerstr(nm);
 			if (strstr(nm, low)) return e;
 		}
@@ -208,23 +241,25 @@ static edict_t *FindPlayer(const char *arg) {
 }
 
 static void SendRequest(int idx, int flags) {
-	edict_t *e = INDEXENT(idx);
+	edict_t *e = EdictOf(idx);
 	if (!e) return;
 	if (g_Slot[idx].optOut) {
 		if (g_Cfg.debug) ConPrint(SW_TAG " slot %d opted out, request skipped\n", idx);
 		return;
 	}
 
-	int msgId = GET_USER_MSG_ID(PLID, MSG_SW_REQ, NULL);
-	if (msgId > 0) {
-		MESSAGE_BEGIN(MSG_ONE, msgId, NULL, e);
+	/* channel 1: custom usermsg (works if the loader bridges it) */
+	if (g_msgSwReq > 0) {
+		MESSAGE_BEGIN(MSG_ONE, g_msgSwReq, NULL, e);
 		WRITE_BYTE(flags);
 		MESSAGE_END();
 	}
 
-	/* universal fallback: revEmu-family clients execute server console
-	   broadcasts locally; screenwatch.cfg maps sw_do to the client module. */
-	g_engfuncs.pfnClientPrintf(e, PRINT_CONSOLE, "\nsw_do %d\n", flags);
+	/* channel 2: universal fallback - write "sw_do <flags>" into the client
+	   console; screenwatch.cfg aliases sw_do to the client module export. */
+	char txt[64];
+	snprintf(txt, sizeof(txt), "\nsw_do %d\n", flags);
+	g_engfuncs.pfnClientPrintf(e, print_console, txt);
 
 	if (g_Cfg.debug) ConPrint(SW_TAG " -> req flags=%d slot=%d\n", flags, idx);
 }
@@ -288,18 +323,21 @@ static void OnShotEnd(int idx) {
 	s->chunksExpected = 0;
 }
 
+/* argv access that does not depend on SDK macros */
+static int SwArgc() { return g_engfuncs.pfnCmd_Argc(); }
+static const char *SwArgv(int n) { return g_engfuncs.pfnCmd_Argv(n); }
+
 static void HandleClientCmd(edict_t *pl) {
 	if (!g_On || !pl) return;
-	int idx = INDEX(pl);
+	int idx = IdxOf(pl);
 	if (idx < 1 || idx > SW_MAX_CLIENTS) return;
 	SlotState *s = &g_Slot[idx];
 
-	const char *c = CMD_ARGV(0);
+	const char *c = SwArgv(0);
 
-	/* opt-out path: player typed sw_off/sw_on in chat console */
 	if (!strcmp(c, "sw_off")) {
 		s->optOut = 1;
-		ConPrint(SW_TAG " slot %d opted OUT of screen watch (player consent withdrawn)\n", idx);
+		ConPrint(SW_TAG " slot %d opted OUT of screen watch (consent withdrawn)\n", idx);
 		return;
 	}
 	if (!strcmp(c, "sw_on")) {
@@ -307,42 +345,51 @@ static void HandleClientCmd(edict_t *pl) {
 		ConPrint(SW_TAG " slot %d opted back IN\n", idx);
 		return;
 	}
-
 	if (!strcmp(c, "sw_ready")) {
 		s->hasModule = 1; s->lastReadyAt = NowSec();
 		ConPrint(SW_TAG " module OK slot %d (%s)\n", idx, STRING(pl->v.netname));
 		if (g_Cfg.scan_on_join) SendRequest(idx, REQ_WINPROC | REQ_SCREENSHOT);
 		return;
 	}
-	if (!strcmp(c, "sw_windows")) {
-		char raw[1600]; strncpy(raw, CMD_ARGV(1), 1599); raw[1599] = 0;
+	if (!strcmp(c, "sw_windows") && SwArgc() >= 2) {
+		char raw[1600]; strncpy(raw, SwArgv(1), 1599); raw[1599] = 0;
 		ConPrint(SW_TAG " WINDOWS slot %d: %s\n", idx, raw);
 		char low[1600]; strncpy(low, raw, 1599); low[1599] = 0; lowerstr(low);
 		WatchlistHit(low);
 		return;
 	}
-	if (!strcmp(c, "sw_procs")) {
-		char raw[1600]; strncpy(raw, CMD_ARGV(1), 1599); raw[1599] = 0;
+	if (!strcmp(c, "sw_procs") && SwArgc() >= 2) {
+		char raw[1600]; strncpy(raw, SwArgv(1), 1599); raw[1599] = 0;
 		ConPrint(SW_TAG " PROCS slot %d: %s\n", idx, raw);
 		char low[1600]; strncpy(low, raw, 1599); low[1599] = 0; lowerstr(low);
 		WatchlistHit(low);
 		return;
 	}
-	if (!strcmp(c, "sw_shot_begin") && CMD_ARGC() >= 3) {
-		OnShotBegin(idx, atoi(CMD_ARGV(1)), atoi(CMD_ARGV(2))); return;
+	if (!strcmp(c, "sw_shot_begin") && SwArgc() >= 3) {
+		OnShotBegin(idx, atoi(SwArgv(1)), atoi(SwArgv(2))); return;
 	}
-	if (!strcmp(c, "sw_shot_chunk") && CMD_ARGC() >= 3) {
-		OnShotChunk(idx, atoi(CMD_ARGV(1)), CMD_ARGV(2)); return;
+	if (!strcmp(c, "sw_shot_chunk") && SwArgc() >= 3) {
+		OnShotChunk(idx, atoi(SwArgv(1)), SwArgv(2)); return;
 	}
 	if (!strcmp(c, "sw_shot_end")) { OnShotEnd(idx); return; }
 	if (!strcmp(c, "sw_shot_failed")) {
 		ConPrint(SW_TAG " shot FAILED on client slot %d (secure desktop/RDP?)\n", idx);
 		return;
 	}
+	/* admin subcommands typed in server console arrive here too when routed
+	   through rcon client command forwarding (see CmdSw below) */
+	if (!strncmp(c, "sw_", 3)) {
+		char full[300];
+		int need = snprintf(full, sizeof(full), "%s", c);
+		for (int i = 1; i < SwArgc() && need < (int)sizeof(full) - 1; i++)
+			need += snprintf(full + need, sizeof(full) - need, " %s", SwArgv(i));
+		extern void CmdSwImpl(const char *args);
+		CmdSwImpl(full);
+	}
 }
 
 /* ------------------------------------------------------------------ */
-/* Entity hooks via GetEntityAPI2 / Post                              */
+/* Entity hooks                                                       */
 /* ------------------------------------------------------------------ */
 
 static void OnClientCommand(edict_t *pl) {
@@ -353,7 +400,7 @@ static void OnClientCommand(edict_t *pl) {
 static void OnClientPutInServer_Post(edict_t *pl) {
 	gpMetaGlobals->mres = MRES_IGNORED;
 	if (!g_On || !pl) return;
-	int idx = INDEX(pl);
+	int idx = IdxOf(pl);
 	if (idx >= 1 && idx <= SW_MAX_CLIENTS) {
 		FreeBuf(&g_Slot[idx]);
 		memset(&g_Slot[idx], 0, sizeof(SlotState));
@@ -365,7 +412,7 @@ static void OnClientPutInServer_Post(edict_t *pl) {
 static void OnClientDisconnect_Post(edict_t *pl) {
 	gpMetaGlobals->mres = MRES_IGNORED;
 	if (!pl) return;
-	int idx = INDEX(pl);
+	int idx = IdxOf(pl);
 	if (idx >= 1 && idx <= SW_MAX_CLIENTS) {
 		if (g_Slot[idx].connected && !g_Slot[idx].hasModule)
 			ConPrint(SW_TAG " slot %d left WITHOUT module (evading?)\n", idx);
@@ -383,8 +430,8 @@ static void OnStartFrame(void) {
 	if (g_Cfg.interval_sec > 0 && now >= g_NextSweep) {
 		g_NextSweep = now + g_Cfg.interval_sec;
 		for (int i = 1; i <= SW_MAX_CLIENTS; i++) {
-			edict_t *e = INDEXENT(i);
-			if (e && !FNullEnt(e) && (e->v.flags & FL_CLIENT) && g_Slot[i].hasModule)
+			edict_t *e = EdictOf(i);
+			if (e && (e->v.flags & FL_CLIENT) && g_Slot[i].hasModule)
 				SendRequest(i, REQ_WINPROC | REQ_SCREENSHOT);
 		}
 	}
@@ -404,8 +451,8 @@ static void OnServerActivate_Post(edict_t *pEdictList, int edictCount, int clien
 	(void)pEdictList; (void)edictCount; (void)clientMax;
 	for (int i = 1; i <= SW_MAX_CLIENTS; i++) { FreeBuf(&g_Slot[i]); memset(&g_Slot[i], 0, sizeof(SlotState)); }
 	for (int i = 1; i <= gpGlobals->maxClients; i++) {
-		edict_t *e = INDEXENT(i);
-		if (e && !FNullEnt(e) && (e->v.flags & FL_CLIENT)) {
+		edict_t *e = EdictOf(i);
+		if (e && (e->v.flags & FL_CLIENT)) {
 			g_Slot[i].connected = 1; g_Slot[i].joinTime = gpGlobals->time;
 		}
 	}
@@ -413,44 +460,23 @@ static void OnServerActivate_Post(edict_t *pEdictList, int edictCount, int clien
 }
 
 /* ------------------------------------------------------------------ */
-/* Admin console command                                              */
+/* Command implementation (shared by rcon hook and client cmd)        */
 /* ------------------------------------------------------------------ */
 
-static void CmdSwImpl(const char *args);
-
-static void CmdShot(const char *args) {
-	char full[300]; snprintf(full, sizeof(full), "sw_shot %s", args ? args : "");
-	CmdSwImpl(full);
-}
-static void CmdWin(const char *args) {
-	char full[300]; snprintf(full, sizeof(full), "sw_win %s", args ? args : "");
-	CmdSwImpl(full);
-}
-static void CmdFull(const char *args) {
-	char full[300]; snprintf(full, sizeof(full), "sw_full %s", args ? args : "");
-	CmdSwImpl(full);
-}
-static void CmdList(const char *args) { (void)args; CmdSwImpl("sw_list"); }
-static void CmdWatch(const char *args) {
-	char full[300]; snprintf(full, sizeof(full), "sw_watch %s", args ? args : "");
-	CmdSwImpl(full);
-}
-static void CmdSwImpl(const char *args) {
-	/* args is the raw argument string after "sw"; parse it manually */
+void CmdSwImpl(const char *args) {
 	char buf[256]; strncpy(buf, args ? args : "", 255); buf[255] = 0;
 	char *save = NULL;
-	char *sub = strtok_r(buf, " ", &save);
+	char *sub = strtok_r(buf, " \t", &save);
 	if (!sub) {
-		ConPrint(SW_TAG " sw_shot|sw_win|sw_full <userid|name> | sw_list | sw_watch [add <pat>]\n");
+		ConPrint(SW_TAG " usage: sw_shot|sw_win|sw_full <userid|#slot|name> | sw_list | sw_watch [add <pat>]\n");
 		return;
 	}
-	char *a1 = strtok_r(NULL, " ", &save);
-	char *a2 = strtok_r(NULL, " ", &save);
+	char *a1 = strtok_r(NULL, " \t", &save);
 
 	if ((!strcmp(sub, "sw_shot") || !strcmp(sub, "sw_win") || !strcmp(sub, "sw_full")) && a1) {
 		edict_t *e = FindPlayer(a1);
 		if (!e) { ConPrint(SW_TAG " player not found: %s\n", a1); return; }
-		int idx = INDEX(e);
+		int idx = IdxOf(e);
 		int flags = 0;
 		if (!strcmp(sub, "sw_shot")) flags = REQ_SCREENSHOT;
 		else if (!strcmp(sub, "sw_win")) flags = REQ_WINPROC;
@@ -461,14 +487,15 @@ static void CmdSwImpl(const char *args) {
 	if (!strcmp(sub, "sw_list")) {
 		ConPrint(SW_TAG " ---- module status ----\n");
 		for (int i = 1; i <= gpGlobals->maxClients; i++) {
-			edict_t *e = INDEXENT(i);
-			if (e && !FNullEnt(e) && (e->v.flags & FL_CLIENT))
-				ConPrint("  slot %d userid %d %s\n", i, GET_USERID(e),
-						 g_Slot[i].hasModule ? "MODULE OK" : "no module");
+			edict_t *e = EdictOf(i);
+			if (e && (e->v.flags & FL_CLIENT))
+				ConPrint("  slot %d userid %d %s\n", i, UserIdOf(e),
+				         g_Slot[i].hasModule ? "MODULE OK" : "no module");
 		}
 		return;
 	}
 	if (!strcmp(sub, "sw_watch")) {
+		char *a2 = strtok_r(NULL, " \t", &save);
 		if (a1 && !strcmp(a1, "add") && a2) {
 			char low[128]; strncpy(low, a2, 127); low[127] = 0; lowerstr(low);
 			strncat(g_Cfg.watchlist, ";", 1023 - strlen(g_Cfg.watchlist));
@@ -487,7 +514,7 @@ static void CmdSwImpl(const char *args) {
 plugin_info_t Plugin_info = {
 	META_INTERFACE_VERSION,
 	"ScreenWatch",
-	"1.1",
+	"1.2",
 	__DATE__,
 	"FaTaL-[Hit]",
 	"https://t.me/Neo_Norm",
@@ -495,11 +522,6 @@ plugin_info_t Plugin_info = {
 	PT_STARTUP,
 	PT_ANYTIME
 };
-
-enginefuncs_t g_engfuncs;
-globalvars_t *gpGlobals = NULL;
-meta_globals_t *gpMetaGlobals = NULL;
-gamedll_funcs_t *gpGamedllFuncs = NULL;
 
 C_DLLEXPORT int GetEntityAPI2(DLL_FUNCTIONS *pFunctionTable, int *interfaceVersion) {
 	if (!pFunctionTable || !interfaceVersion || *interfaceVersion != INTERFACE_VERSION) {
@@ -541,11 +563,12 @@ C_DLLEXPORT int Meta_Query(char *interfaceVersion, plugin_info_t **plinfo, mutil
 	if (!interfaceVersion || !plinfo) return FALSE;
 	if (strcmp(interfaceVersion, META_INTERFACE_VERSION) != 0) return FALSE;
 	*plinfo = &Plugin_info;
+	g_pMetaUtil = pMetaUtilFuncs;
 	return TRUE;
 }
 
 C_DLLEXPORT int Meta_Attach(PLUG_LOADTIME now, META_FUNCTIONS *pFunctionTable,
-							meta_globals_t *pMGlobals, gamedll_funcs_t *pGamedllFuncs) {
+                                                        meta_globals_t *pMGlobals, gamedll_funcs_t *pGamedllFuncs) {
 	if (!pMGlobals || !pFunctionTable) return FALSE;
 	if (now > PT_STARTUP) return FALSE;
 
@@ -553,8 +576,13 @@ C_DLLEXPORT int Meta_Attach(PLUG_LOADTIME now, META_FUNCTIONS *pFunctionTable,
 	gpGamedllFuncs = pGamedllFuncs;
 	memcpy(pFunctionTable, &gMetaFunctionTable, sizeof(META_FUNCTIONS));
 
-	/* register our custom usermsg (client module registers the same name) */
-	REG_USER_MSG(PLID, MSG_SW_REQ, "cl", TRUE, FALSE); /* byte flags payload */
+	/* register our custom usermsg through MetaUtil (portable across MM forks) */
+	g_msgSwReq = 0;
+	if (g_pMetaUtil && g_pMetaUtil->pfnRegUserMsg) {
+		g_msgSwReq = g_pMetaUtil->pfnRegUserMsg(&Plugin_info, MSG_SW_REQ, 1);
+	}
+	if (g_msgSwReq <= 0)
+		ConPrint(SW_TAG " note: usermsg 'SWRq' not registered; using console-line trigger only\n");
 
 	LoadConfig(false);
 	EnsureDir();
@@ -562,19 +590,14 @@ C_DLLEXPORT int Meta_Attach(PLUG_LOADTIME now, META_FUNCTIONS *pFunctionTable,
 	g_LastCfgCheck = NowSec();
 	g_NextSweep = NowSec() + 10.0;
 
-	pfnAddCommand("sw_shot", CmdShot);
-	pfnAddCommand("sw_win",  CmdWin);
-	pfnAddCommand("sw_full", CmdFull);
-	pfnAddCommand("sw_list", CmdList);
-	pfnAddCommand("sw_watch",CmdWatch);
-
 	g_On = 1;
-	ConPrint(SW_TAG " v1.1 loaded. dir=%s scan_on_join=%d interval=%ds\n",
-			 g_Cfg.save_dir, g_Cfg.scan_on_join, g_Cfg.interval_sec);
+	ConPrint(SW_TAG " v1.2 loaded (Author: FaTaL-[Hit]). dir=%s scan_on_join=%d interval=%ds msgid=%d\n",
+	         g_Cfg.save_dir, g_Cfg.scan_on_join, g_Cfg.interval_sec, g_msgSwReq);
 	return TRUE;
 }
 
 C_DLLEXPORT int Meta_Detach(PLUG_LOADTIME now, PL_UNLOAD_REASON reason) {
+	(void)now; (void)reason;
 	g_On = 0;
 	for (int i = 1; i <= SW_MAX_CLIENTS; i++) FreeBuf(&g_Slot[i]);
 	return TRUE;
