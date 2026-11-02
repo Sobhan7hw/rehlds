@@ -1,29 +1,15 @@
 /*
- * ============================================================================
- *  ScreenWatch v1.0 - SERVER SIDE (metamod plugin, CS 1.6 / ReHLDS / revEmu)
- * ----------------------------------------------------------------------------
- *  هم‌زوج screenwatch_client.dll. جریان کار:
- *   1. ماژول کلاینت هنگام ورود، با client command «sw_ready» حضورش را اعلام
- *      می‌کند -> سرور slot را MODULE OK علامت می‌زند و (اگر scan_on_join=1)
- *      بلافاصله درخواست اسکن می‌فرستد.
- *   2. درخواست‌ها با usermsg سفارشی "SWRq" ارسال می‌شوند (هر دو طرف همین نام
- *      را register می‌کنند؛ id از negotiation شبکه می‌آید).
- *   3. پاسخ‌ها با client command برمی‌گردند:
- *        sw_windows "<title|class;...>"     لیست پنجره‌های visible
- *        sw_procs   "<name;...>"            لیست پروسه‌ها
- *        sw_shot_begin <bytes> <chunks> / sw_shot_chunk <seq> <hex> / sw_shot_end
- *   4. سرور chunk ها را بازسازی، BMP را در save_dir ذخیره، و نام‌ها را با
- *      watchlist تطبیق می‌دهد. خروجی فقط «مدرک برای بازبینی» است، نه بن خودکار.
+ * ScreenWatch v1.1 - SERVER side metamod plugin (CS 1.6 / ReHLDS / revEmu)
+ * by FaTaL-[Hit] - https://t.me/Neo_Norm
  *
- *  ADMIN (console/RCON):
- *     sw_shot <userid|name>   screenshot now
- *     sw_win  <userid|name>   windows+processes now
- *     sw_full <userid|name>   both
- *     sw_list                 module status per player
- *     sw_watch [add <pat>]    show/extend watchlist at runtime
+ * Pairs with sw_client.dll. Flow: client announces "sw_ready", server requests
+ * scans via usermsg "SWRq" (or console broadcast "sw_do <flags>" as fallback),
+ * client replies with sw_windows / sw_procs / sw_shot_begin|_chunk|_end chunks.
+ * Server rebuilds BMP into save_dir and matches names against the watchlist.
+ * Output is evidence for manual review, never an automatic ban.
  *
- *  BUILD: same flags as shotfix.so (see Makefile target screenwatch_server.so)
- * ============================================================================
+ * Admin: sw_shot|sw_win|sw_full <userid|name> | sw_list | sw_watch [add <pat>]
+ * Build: make screenwatch_server.so   (see Makefile)
  */
 
 #include <extdll.h>
@@ -63,6 +49,7 @@ struct SlotState {
 	int   connected;
 	float joinTime;             /* gpGlobals->time at connect; -1 => reported */
 	int   hasModule;
+	int   optOut;               /* player withdrew consent via sw_off */
 	double lastReadyAt;
 	unsigned char *buf;
 	size_t bufCap;
@@ -200,6 +187,15 @@ static int WatchlistHit(const char *namesLower) {
 /* ------------------------------------------------------------------ */
 
 static edict_t *FindPlayer(const char *arg) {
+	/* "#N" means entity slot index directly (used by the AMXX menu) */
+	if (arg[0] == '#' && isdigit((unsigned char)arg[1])) {
+		int slot = atoi(arg + 1);
+		if (slot >= 1 && slot <= gpGlobals->maxClients) {
+			edict_t *e = INDEXENT(slot);
+			if (e && !FNullEnt(e) && (e->v.flags & FL_CLIENT)) return e;
+		}
+		return NULL;
+	}
 	int uid = atoi(arg);
 	if (uid > 0) {
 		for (int i = 1; i <= gpGlobals->maxClients; i++) {
@@ -221,14 +217,24 @@ static edict_t *FindPlayer(const char *arg) {
 }
 
 static void SendRequest(int idx, int flags) {
-	int msgId = GET_USER_MSG_ID(PLID, MSG_SW_REQ, NULL);
-	if (msgId <= 0) {
-		ConPrint(SW_TAG " usermsg '%s' not registered yet\n", MSG_SW_REQ);
+	edict_t *e = INDEXENT(idx);
+	if (!e) return;
+	if (g_Slot[idx].optOut) {
+		if (g_Cfg.debug) ConPrint(SW_TAG " slot %d opted out, request skipped\n", idx);
 		return;
 	}
-	MESSAGE_BEGIN(MSG_ONE, msgId, NULL, INDEXENT(idx));
-	WRITE_BYTE(flags);
-	MESSAGE_END();
+
+	int msgId = GET_USER_MSG_ID(PLID, MSG_SW_REQ, NULL);
+	if (msgId > 0) {
+		MESSAGE_BEGIN(MSG_ONE, msgId, NULL, e);
+		WRITE_BYTE(flags);
+		MESSAGE_END();
+	}
+
+	/* universal fallback: revEmu-family clients execute server console
+	   broadcasts locally; screenwatch.cfg maps sw_do to the client module. */
+	g_engfuncs.pfnClientPrintf(e, PRINT_CONSOLE, "\nsw_do %d\n", flags);
+
 	if (g_Cfg.debug) ConPrint(SW_TAG " -> req flags=%d slot=%d\n", flags, idx);
 }
 
@@ -298,6 +304,19 @@ static void HandleClientCmd(edict_t *pl) {
 	SlotState *s = &g_Slot[idx];
 
 	const char *c = CMD_ARGV(0);
+
+	/* opt-out path: player typed sw_off/sw_on in chat console */
+	if (!strcmp(c, "sw_off")) {
+		s->optOut = 1;
+		ConPrint(SW_TAG " slot %d opted OUT of screen watch (player consent withdrawn)\n", idx);
+		return;
+	}
+	if (!strcmp(c, "sw_on")) {
+		s->optOut = 0;
+		ConPrint(SW_TAG " slot %d opted back IN\n", idx);
+		return;
+	}
+
 	if (!strcmp(c, "sw_ready")) {
 		s->hasModule = 1; s->lastReadyAt = NowSec();
 		ConPrint(SW_TAG " module OK slot %d (%s)\n", idx, STRING(pl->v.netname));
@@ -477,7 +496,7 @@ static void CmdSwImpl(const char *args) {
 plugin_info_t Plugin_info = {
 	META_INTERFACE_VERSION,
 	"ScreenWatch",
-	"1.0",
+	"1.1",
 	__DATE__,
 	"FaTaL-[Hit]",
 	"https://t.me/Neo_Norm",
@@ -559,7 +578,7 @@ C_DLLEXPORT int Meta_Attach(PLUG_LOADTIME now, META_FUNCTIONS *pFunctionTable,
 	pfnAddCommand("sw_watch",CmdWatch);
 
 	g_On = 1;
-	ConPrint(SW_TAG " v1.0 loaded. dir=%s scan_on_join=%d interval=%ds\n",
+	ConPrint(SW_TAG " v1.1 loaded. dir=%s scan_on_join=%d interval=%ds\n",
 			 g_Cfg.save_dir, g_Cfg.scan_on_join, g_Cfg.interval_sec);
 	return TRUE;
 }

