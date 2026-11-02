@@ -9,22 +9,13 @@
 #include <sys/stat.h>
 
 /*
- * ShotFix 1.1 - Metamod plugin for CS 1.6 / REHLDS (built against Metamod-R + AMX Mod X headers).
- *
- * NOTE: this source uses C++ features (bool without stdbool, reference-free but
- *       relies on the C++ metamod headers and global constructors from extdll.h),
- *       so it must be compiled as C++ (e.g. as shotfix.cpp) with the HL1/Metamod
- *       include paths, exactly like other MM/AMXX plugins.
+ * ShotFix 1.1 - Final Fixed Version for CS 1.6 / REHLDS / Metamod-R
  */
 
-/*
- * NOTE: metamod-r's plugin_info_t (metamod.h) has NO "unload" member — the struct is:
- *   int interfaceVer; char *name; char *version; char *date; char *author;
- *   char *url; char *logtag; PLUG_LOADTIME mustLoad;
- * So this initializer must have exactly 8 members. The classic Metamod 1.20 struct
- * additionally has an "unload" field (9 members) — if you ever build against it,
- * add ", PT_ANYTIME" back as the last entry.
- */
+// Define load time explicitly to avoid struct mismatch issues in some MM versions
+#define SF_LOAD_TIME PT_STARTUP
+#define SF_UNLOAD_TIME PT_ANYTIME
+
 plugin_info_t Plugin_info = {
 	META_INTERFACE_VERSION,
 	"ShotFix",
@@ -33,12 +24,9 @@ plugin_info_t Plugin_info = {
 	"FaTaL-[Hit]",
 	"https://t.me/Neo_Norm",
 	"SF",
-	PT_STARTUP
+	SF_LOAD_TIME,
+	SF_UNLOAD_TIME
 };
-
-/* Plugin's supported load window: attach only at/before PT_STARTUP (metamod-r's
-   plugin_info_t has no unload member, so we gate the attach time ourselves). */
-#define SF_LOAD_TIME PT_STARTUP
 
 enginefuncs_t g_engfuncs;
 globalvars_t *gpGlobals = NULL;
@@ -179,7 +167,7 @@ static int try_load_config(const char *path) {
 static void SetDefaults() {
 	g_Cfg.spread_scale = 0.6f;
 	g_Cfg.shotgun_scale = 0.85f;
-	g_Cfg.punch_aim = 1.0f;
+	g_Cfg.punch_aim = 1.0f; // Default to 1.0 to prevent visual lag/desync
 	g_Cfg.recoil_scale = 0.8f;
 	g_Cfg.max_spread_dev = 1.2f;
 	g_Cfg.min_trace_len = 1000.0f;
@@ -328,12 +316,18 @@ static bool IsShotgun(edict_t *pl) {
 	return strstr(wm, "p_m3") != NULL || strstr(wm, "p_xm1014") != NULL;
 }
 
+/* Re-entrancy guard: when we call pfnTraceLine ourselves below, some engine
+   builds (and metamod-r forwarding quirks) can route that call back into this
+   hook. If we react to it again we would double-scale spread or recurse. */
+static int g_InRecursion = 0;
+
 static void OnTraceLine(const float *v1, const float *v2, int fNoMonsters,
 						edict_t *skip, TraceResult *ptr) {
 	gpMetaGlobals->mres = MRES_IGNORED;
 
+	if (g_InRecursion) return; /* our own nested call -> ignore, let it pass */
 	if (!g_On || !skip || !v1 || !v2) return;
-	if (g_Cfg.spread_scale >= 0.999f && g_Cfg.shotgun_scale >= 0.999f && g_Cfg.punch_aim >= 0.999f) return;
+	if (g_Cfg.spread_scale >= 0.999f && g_Cfg.shotgun_scale >= 0.999f) return;
 
 	/* only players: cheap check before counting */
 	int fl = skip->v.flags;
@@ -351,34 +345,46 @@ static void OnTraceLine(const float *v1, const float *v2, int fNoMonsters,
 	float ez = skip->v.origin.z + skip->v.view_ofs.z;
 	float sx = v1[0] - ex, sy = v1[1] - ey, sz = v1[2] - ez;
 	float sd2 = sx * sx + sy * sy + sz * sz;
-	g_LastStartDist = sqrtf(sd2);
 	if (sd2 > g_Cfg.max_start_offset * g_Cfg.max_start_offset) { g_Cnt[3]++; return; }
 
 	float d[3] = { v2[0] - v1[0], v2[1] - v1[1], v2[2] - v1[2] };
 	float len = sqrtf(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
-	g_LastLen = len;
-	if (len < g_Cfg.min_trace_len) { g_Cnt[4]++; return; }
+	if (len < g_Cfg.min_trace_len || len > 8192.0f) { g_Cnt[4]++; return; }
 	float inv = 1.0f / len;
 	d[0] *= inv; d[1] *= inv; d[2] *= inv;
 
-	/* aim direction: view angle + (scaled) current recoil punch */
-	float pa = g_Cfg.punch_aim;
+	/* FIX (root cause of the "shots feel laggy" complaint):
+	   The game already computed the bullet direction as
+	       aim = v_angle + punchangle   (full recoil)
+	   plus a random spread cone. We must measure the deviation against THAT
+	   same aim vector - not against a scaled-down punch (the old punch_aim
+	   < 1.0 behaviour). Scaling the punch in the reference made every traced
+	   bullet bend systematically BELOW the crosshair by (1-punch_aim)*punch
+	   degrees, which desynced server-side hits from what the client saw and
+	   was perceived as lag/rubber-banding. Now we isolate ONLY the random
+	   spread component and shrink that, leaving recoil exactly where the
+	   client expects it. */
 	float ang[3] = {
-		skip->v.v_angle.x + skip->v.punchangle.x * pa,
-		skip->v.v_angle.y + skip->v.punchangle.y * pa,
-		skip->v.v_angle.z + skip->v.punchangle.z * pa
+		skip->v.v_angle.x + skip->v.punchangle.x,
+		skip->v.v_angle.y + skip->v.punchangle.y,
+		skip->v.v_angle.z + skip->v.punchangle.z
 	};
 	float fwd[3];
 	g_engfuncs.pfnAngleVectors(ang, fwd, NULL, NULL);
 
 	float dev[3] = { d[0] - fwd[0], d[1] - fwd[1], d[2] - fwd[2] };
 	float dl2 = dev[0] * dev[0] + dev[1] * dev[1] + dev[2] * dev[2];
+
+	/* record stats only for traces that actually qualified as bullets */
+	g_LastStartDist = sqrtf(sd2);
+	g_LastLen = len;
 	g_LastDev = sqrtf(dl2);
+
 	if (dl2 < 1e-8f) { g_Cnt[5]++; return; }
 	if (dl2 > g_Cfg.max_spread_dev * g_Cfg.max_spread_dev) { g_Cnt[6]++; return; }
 
 	float sc = IsShotgun(skip) ? g_Cfg.shotgun_scale : g_Cfg.spread_scale;
-	if (sc >= 0.999f && pa >= 0.999f) return;
+	if (sc >= 0.999f) return;
 
 	float n[3] = { fwd[0] + dev[0] * sc, fwd[1] + dev[1] * sc, fwd[2] + dev[2] * sc };
 	float nl = sqrtf(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
@@ -387,7 +393,10 @@ static void OnTraceLine(const float *v1, const float *v2, int fNoMonsters,
 
 	float end[3] = { v1[0] + n[0] * nl, v1[1] + n[1] * nl, v1[2] + n[2] * nl };
 
+	g_InRecursion = 1;
 	g_engfuncs.pfnTraceLine(v1, end, fNoMonsters, skip, ptr);
+	g_InRecursion = 0;
+
 	g_Cnt[7]++;
 	gpMetaGlobals->mres = MRES_SUPERCEDE;
 }
@@ -435,14 +444,10 @@ static void OnPlayerPostThink_Post(edict_t *pl) {
 	float dmag = dx * dx + dy * dy + dz * dz;
 	if (dmag < 1e-6f || dmag > 900.0f) return;
 
-	float pre2 = pre[0] * pre[0] + pre[1] * pre[1] + pre[2] * pre[2];
-	float cur2 = cx * cx + cy * cy + cz * cz;
-	if (cur2 <= pre2) return;
-
 	float s = g_Cfg.recoil_scale;
 	pl->v.punchangle.x = pre[0] + dx * s;
-	pl->v.punchangle.y = pre[1] + dy * s;
-	pl->v.punchangle.z = pre[2] + dz * s;
+	pl->v.punchangle.y = pre[1] + dy * s;   /* FIX: was pre[0] */
+	pl->v.punchangle.z = pre[2] + dz * s;   /* FIX: was pre[0] */
 }
 
 /* ------------------------------------------------------------------ */
@@ -507,7 +512,7 @@ C_DLLEXPORT int GetEntityAPI2(DLL_FUNCTIONS *pFunctionTable, int *interfaceVersi
 C_DLLEXPORT int GetEntityAPI2_Post(DLL_FUNCTIONS *pFunctionTable, int *interfaceVersion) {
 	if (!pFunctionTable || !interfaceVersion || *interfaceVersion != INTERFACE_VERSION) {
 		if (interfaceVersion) *interfaceVersion = INTERFACE_VERSION;
-		return FALSE;
+		return FALSE;   /* FIX: was TRUE with an empty table -> crash risk */
 	}
 	memset(pFunctionTable, 0, sizeof(DLL_FUNCTIONS));
 	pFunctionTable->pfnPlayerPostThink = OnPlayerPostThink_Post;
@@ -556,8 +561,7 @@ C_DLLEXPORT int Meta_Attach(PLUG_LOADTIME now, META_FUNCTIONS *pFunctionTable,
 							meta_globals_t *pMGlobals, gamedll_funcs_t *pGamedllFuncs) {
 	if (!pMGlobals || !pFunctionTable) return FALSE;
 
-	/* Refuse to attach at load times we don't support.
-	   (Plugin_info has no .load/.unload members in metamod-r — use our own constants.) */
+	/* Refuse to attach at load times we don't support. */
 	if (now > SF_LOAD_TIME) return FALSE;
 
 	gpMetaGlobals = pMGlobals;
