@@ -1,0 +1,5 @@
+; Copy this line into addons/metamod/plugins.ini (or configs/metamod/plugins.ini on ReHLDS)
+; Linux:
+linux addons/shot_fix/shotfix.so "ShotFix" "FaTaL-[Hit]" "v1.1" "" ""
+; Windows (if you also build the dll):
+win32 addons/shot_fix/shotfix.dll "ShotFix" "FaTaL-[Hit]" "v1.1" "" ""
