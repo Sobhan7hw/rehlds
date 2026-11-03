@@ -80,16 +80,14 @@ static void *EngineFnAt(int off) {
         return fn;
 }
 
-static int EngOffsetOf(const char *member) {
-        return (int)((size_t)&((enginefuncs_t *)0)->member);
-}
+#define RM_ENG_OFF(member)   ((int)(size_t)&((enginefuncs_t *)0)->member)
 
 static void ResolveEngineFns() {
         /* pfnCvar_Register lives just before pfnCVarGetPointer in HLSDK. */
         g_pfnCvarRegister = (CvarRegisterFn)
-                EngineFnAt(EngOffsetOf(pfnCVarGetPointer) - (int)sizeof(void *));
+                EngineFnAt(RM_ENG_OFF(pfnCVarGetPointer) - (int)sizeof(void *));
         g_pfnAddCommand = (void (*)(const char *, void (*)()))
-                EngineFnAt(EngOffsetOf(pfnAddCommand));
+                EngineFnAt(RM_ENG_OFF(pfnAddCommand));
 }
 
 static void AddConsoleCommand(const char *name, CmdFunction fn) {
@@ -264,31 +262,51 @@ static int g_BuildNum = 0;
 
 typedef void *(*RmCreateIface)(const char *, int *);
 
+/* IRehldsServerStatic: the first four vtable slots are pure virtuals and
+ * slot #4 (index 3) is GetVersion(), which returns the ReHLDS build number.
+ * This is the same mechanism net_tune uses through the official SDK header,
+ * so no compile-time flags are needed: on a real ReHLDS engine the number
+ * comes back at runtime.  We deliberately do NOT probe "VRehldsServerStatic002":
+ * that id does not exist in ReHLDS and unknown interface ids can abort the
+ * server during plugin load. */
 struct RmServerStaticVtbl {
-	void *pads[8];                    /* skip first 8 vtable slots       */
-	int (*GetBuildNum)(void *self);   /* slot 9 in IRehldsServerStatic   */
+	void *pads[3];                 /* skip first 3 vtable slots        */
+	int (*GetVersion)();           /* slot 4 -> ReHLDS build number    */
 };
 
-static int DetectRehldsBuild() {
-	void *h = NULL;
-	const char *names[] = { "engine_i486.so", "./engine_i486.so" };
-	for (size_t i = 0; i < sizeof(names) / sizeof(names[0]) && !h; i++)
-		h = dlopen(names[i], RTLD_NOW | RTLD_NOLOAD);
-	if (!h) return 0;
-
-	RmCreateIface fn = (RmCreateIface)dlsym(h, "CreateInterface");
-	dlclose(h); /* engine stays loaded; this only drops our extra reference */
+static int ProbeRmSvs(RmCreateIface fn) {
 	if (!fn) return 0;
-
 	int ok = 0;
 	void *svs = fn("VRehldsServerStatic001", &ok);
 	if (!svs || !ok) return 0;
-
 	RmServerStaticVtbl *vt = *(RmServerStaticVtbl **)svs;
-	if (!vt || !vt->GetBuildNum) return 0;
+	if (vt && vt->GetVersion) {
+		int bn = vt->GetVersion();
+		if (bn >= 1 && bn <= 99999) return bn;
+	}
+	return 0;
+}
 
-	int bn = vt->GetBuildNum(svs);
-	return (bn > 0) ? bn : 0;
+static int DetectRehldsBuild() {
+	/* Method A: locate the already-loaded engine module and use ITS OWN
+	 * CreateInterface (same approach as net_tune's RehldsInit). */
+	void *h = NULL;
+	const char *names[] = { "engine_i486.so", "./engine_i486.so", "engine.so", "./engine.so" };
+	for (size_t i = 0; i < sizeof(names) / sizeof(names[0]) && !h; i++)
+		h = dlopen(names[i], RTLD_LAZY | RTLD_NOLOAD);
+
+	if (h) {
+		RmCreateIface fn = (RmCreateIface)dlsym(h, "CreateInterface");
+		dlclose(h); /* engine stays loaded; this only drops our extra reference */
+		int bn = ProbeRmSvs(fn);
+		if (bn > 0) return bn;
+	}
+
+	/* Method B: engine exports CreateInterface into the global namespace */
+	int bn = ProbeRmSvs((RmCreateIface)dlsym(RTLD_DEFAULT, "CreateInterface"));
+	if (bn > 0) return bn;
+
+	return 0;
 }
 
 static int ActiveTic() {

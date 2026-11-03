@@ -127,18 +127,20 @@ static void ConPrint(const char *fmt, ...) {
 typedef void *(*SfCreateIface)(const char *, int *);
 
 /* ------------------------------------------------------------------ */
-/* ReHLDS build detection.  Two independent runtime methods:           */
-/*  A) dlopen the already-loaded engine image and call ITS OWN         */
-/*     CreateInterface for VRehldsServerStatic001/002.                 */
-/*  B) fallback: CreateInterface reachable in the global symbol        */
-/*     namespace via dlsym(RTLD_DEFAULT).                              */
-/* Then read the build number two ways: memory scan of the server-     */
-/* static object first (layout independent), vtable slot second.       */
+/* ReHLDS build detection -- exactly the mechanism net_tune uses:      */
+/* dlopen the ALREADY-LOADED engine image (RTLD_NOLOAD), grab its own  */
+/* CreateInterface and ask for the Rehlds server-static interface      */
+/* "VRehldsServerStatic001".  No compile-time flags are required:      */
+/* on a real ReHLDS build the number comes back at runtime.            */
+/*                                                                     */
+/* NOTE: we deliberately do NOT probe "VRehldsServerStatic002": that   */
+/* id does not exist in ReHLDS and some interfaces assert/abort on an  */
+/* unknown request, which would kill the server during plugin load.    */
 /* ------------------------------------------------------------------ */
 
 struct SfServerStaticVtbl {
-	void *pads[8];                    /* skip first 8 vtable slots       */
-	int (*GetBuildNum)(void *self);   /* slot 9 in IRehldsServerStatic   */
+	void *pads[3];                    /* skip first 3 vtable slots        */
+	int (*GetVersion)();              /* slot 4 in IRehldsServerStatic    */
 };
 
 static int ProbeSvsVersion(SfCreateIface fn, const char *iface) {
@@ -147,19 +149,17 @@ static int ProbeSvsVersion(SfCreateIface fn, const char *iface) {
 	void *svs = fn(iface, &ok);
 	if (!svs || !ok) return 0;
 
-	/* 1) vtable call GetBuildNum() -- canonical ReHLDS way.  The result is
-	    sanity-checked so a wrong vtable slot can never print nonsense. */
-	SfServerStaticVtbl *vt = *(SfServerStaticVtbl **)svs;
-	if (vt && vt->GetBuildNum) {
-		int bn = vt->GetBuildNum(svs);
-		if (bn >= 1500 && bn <= 99999) return bn;
+	/* vtable call GetVersion() -- canonical ReHLDS way.  The result is
+	 * sanity-checked so a wrong vtable slot can never print nonsense. */
+	struct SfServerStaticVtbl *vt = *(struct SfServerStaticVtbl **)svs;
+	if (vt && vt->GetVersion) {
+		int bn = vt->GetVersion();
+		if (bn >= 1 && bn <= 99999) return bn;
 	}
-
 	return 0;
 }
 
-static int g_BuildNum = 0;      /* detected ReHLDS build number, 0 = unknown */
-static int g_cbEngTable = -1;   /* bytes of enginefuncs_t the engine filled  */
+static int g_BuildNum = 0;	/* detected ReHLDS build number, 0 = unknown */
 
 static int DetectRehldsBuild() {
 	/* Method A: locate the loaded engine module by name */
@@ -171,24 +171,18 @@ static int DetectRehldsBuild() {
 	if (h) {
 		SfCreateIface fn = (SfCreateIface)dlsym(h, "CreateInterface");
 		dlclose(h); /* engine stays loaded; this only drops our extra reference */
-		if (fn) {
-			int bn = ProbeSvsVersion(fn, "VRehldsServerStatic001");
-			if (!(bn > 0)) bn = ProbeSvsVersion(fn, "VRehldsServerStatic002");
-			if (bn > 0) return bn;
-		}
+		int bn = ProbeSvsVersion(fn, "VRehldsServerStatic001");
+		if (bn > 0) return bn;
 	}
 
 	/* Method B: engine exports CreateInterface into the global namespace */
 	SfCreateIface gfn = (SfCreateIface)dlsym(RTLD_DEFAULT, "CreateInterface");
-	if (gfn) {
-		int bn = ProbeSvsVersion(gfn, "VRehldsServerStatic001");
-		if (!(bn > 0)) bn = ProbeSvsVersion(gfn, "VRehldsServerStatic002");
-		if (bn > 0) return bn;
-	}
+	int bn = ProbeSvsVersion(gfn, "VRehldsServerStatic001");
+	if (bn > 0) return bn;
 
 	/* Method C: read the exported engine global holding the build number.
-	    Older ReHLDS revisions export it under different mangled names, so
-	    try each known spelling; missing symbols simply return NULL. */
+	   Older ReHLDS revisions export it under different mangled names, so
+	   try each known spelling; missing symbols simply return NULL. */
 	const char *syms[] = { "g_svbuildnum", "sv_buildnum", "g_iServerBuild" };
 	for (size_t i = 0; i < sizeof(syms) / sizeof(syms[0]); i++) {
 		int *pv = (int *)dlsym(RTLD_DEFAULT, syms[i]);
@@ -651,6 +645,7 @@ C_DLLEXPORT void GiveFnptrsToDll(enginefuncs_t *pengfuncs, globalvars_t *pGlobal
  * to call on any engine version. */
 C_DLLEXPORT int GetEngineFunctions_Post(enginefuncs_t *pengfuncsFromEngine, int *interfaceVersion) {
 	(void)interfaceVersion;
+	static int g_cbEngTable = -1;   /* bytes of enginefuncs_t the engine filled */
 	if (pengfuncsFromEngine) {
 		const unsigned char *p = (const unsigned char *)pengfuncsFromEngine;
 		int maxBytes = (int)sizeof(enginefuncs_t) + (int)sizeof(void *);
