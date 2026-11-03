@@ -32,24 +32,71 @@
 #if NT_HAVE_REHLDS
 #include <rehlds_api.h>   /* SDK: rehlds_sdk/rehlds/public/rehlds */
 
-/* ReHLDS SDK generations use different names on the hook registry:
- *   current master : addHook(...)     / removeHook(...)
- *   older releases : registerHook(...)/unregisterHook(...)
- * The macro NT_HOOK_REG picks whichever name the installed headers declare,
- * so ONE source file compiles against both (evaluated at preprocessing time
- * is impossible; instead we rely on a tiny compatibility shim: if the SDK
- * only has one spelling, define the other as an inline alias here). */
-#if defined(NT_REGISTRY_ADDHOOK)          /* released 3.15+ SDK */
+/* Hook-registry API auto-detection (compile-time, NO extra flags needed):
+ * ReHLDS SDK generations spell the registry methods differently:
+ *   released master / current dev : IHookChainRegistry::registerHook / unregisterHook
+ *   some older builds             : addHook / removeHook
+ * We detect which spelling exists by probing a member-pointer against the
+ * typedef the SDK itself declares for the SV_EmitPings hookchain. The two
+ * spellings are mutually exclusive in every known header, so the probe is
+ * unambiguous. Force a specific spelling only if ever needed:
+ * -DNT_REGISTRY_ADDHOOK or -DNT_REGISTRY_REGHOOK. */
+
+#if !defined(NT_REGISTRY_ADDHOOK) && !defined(NT_REGISTRY_REGHOOK)
+
+/* the chain type the SDK uses for SV_EmitPings handlers */
+typedef void (*NtEmitPingsFn)(IHookChain<void, IGameClient *, sizebuf_t *> *, IGameClient *, sizebuf_t *);
+
+template <typename R> struct NtHasRegHook {
+	static char Test(void (R::*)(NtEmitPingsFn));
+	static int  Test(...);
+	template <typename T> static auto Probe(int) -> decltype(&T::registerHook, char());
+	template <typename T> static int  Probe(...);
+	enum { value = sizeof(Probe<R>(0)) == sizeof(char) };
+};
+template <typename R> struct NtHasAddHook {
+	static char Test(void (R::*)(NtEmitPingsFn));
+	static int  Test(...);
+	template <typename T> static auto Probe(int) -> decltype(&T::addHook, char());
+	template <typename T> static int  Probe(...);
+	enum { value = sizeof(Probe<R>(0)) == sizeof(char) };
+};
+
+#define NT_ENABLE_IF_C(c) typename __gnu_cxx::__enable_if<(c), int>::__type
+
+template <typename R> static inline NT_ENABLE_IF_C(NtHasRegHook<R>::value)
+NtRegPick(R *r, NtEmitPingsFn fn) { r->registerHook(fn); return 0; }
+template <typename R> static inline NT_ENABLE_IF_C(!NtHasRegHook<R>::value && NtHasAddHook<R>::value)
+NtRegPick(R *r, NtEmitPingsFn fn) { r->addHook(fn); return 0; }
+template <typename R> static inline NT_ENABLE_IF_C(!NtHasRegHook<R>::value && !NtHasAddHook<R>::value)
+NtRegPick(R *, NtEmitPingsFn) { return -1; }
+
+template <typename R> static inline NT_ENABLE_IF_C(NtHasRegHook<R>::value)
+NtUnregPick(R *r, NtEmitPingsFn fn) { r->unregisterHook(fn); return 0; }
+template <typename R> static inline NT_ENABLE_IF_C(!NtHasRegHook<R>::value && NtHasAddHook<R>::value)
+NtUnregPick(R *r, NtEmitPingsFn fn) { r->removeHook(fn); return 0; }
+template <typename R> static inline NT_ENABLE_IF_C(!NtHasRegHook<R>::value && !NtHasAddHook<R>::value)
+NtUnregPick(R *, NtEmitPingsFn) { return -1; }
+
+#define NT_REGISTER(chainobj, funcname, handler)   NtRegPick((chainobj)->funcname(), (handler))
+#define NT_UNREGISTER(chainobj, funcname, handler) NtUnregPick((chainobj)->funcname(), (handler))
+
+#else /* manual override: force one spelling */
+
+#if defined(NT_REGISTRY_ADDHOOK)
 #  define NT_REG_ADD(reg, fn)    ((reg)->addHook(fn))
 #  define NT_REG_REM(reg, fn)    ((reg)->removeHook(fn))
-#else                                     /* default: classic metamod-style names */
+#else
 #  define NT_REG_ADD(reg, fn)    ((reg)->registerHook(fn))
 #  define NT_REG_REM(reg, fn)    ((reg)->unregisterHook(fn))
 #endif
 #define NT_REGISTER(chainobj, funcname, handler)   NT_REG_ADD((chainobj)->funcname(), (handler))
 #define NT_UNREGISTER(chainobj, funcname, handler) NT_REG_REM((chainobj)->funcname(), (handler))
 
+#endif /* auto-detect vs manual override */
+
 #endif
+
 
 /*
  * NetTune 1.7 - Smart connection tuner for CS 1.6 / ReHLDS / Metamod-R
