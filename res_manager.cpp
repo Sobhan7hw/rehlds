@@ -40,9 +40,44 @@ meta_globals_t *gpMetaGlobals = NULL;
 gamedll_funcs_t *gpGamedllFuncs = NULL;
 
 /* rm_status: 0 = silent, 1 = print a status line to console every 60s */
-static cvar_t g_RmStatus = { "rm_status", "0", 0.0f, 0, NULL };
+static cvar_t g_RmStatus = { "rm_status", "0", 0, 0, NULL };
 
+/*
+ * Real HLSDK/ReHLDS enginefuncs_t has NO pfnAddCommand / pfnRegisterCVar.
+ * Console commands must be added through the Metamod utility table
+ * (mutil_funcs_t::pfnAddCommand), and cvars are registered through
+ * pfnCvar_Register (note the underscore).  These thin wrappers keep the
+ * plugin compiling and working against both the real SDK and the minimal
+ * stand-in headers used for syntax checks.
+ */
 #define RM_TAG "[RM]"
+
+typedef void (*CmdFunction)(void);
+typedef void (*CvarRegisterFn)(cvar_t *);
+
+void ConPrint(const char *fmt, ...);   /* defined below */
+
+static mutil_funcs_t *g_pMetaUtilFuncs = NULL;
+static CvarRegisterFn g_pfnCvarRegister = NULL;
+
+static void AddConsoleCommand(const char *name, CmdFunction fn) {
+        if (g_pMetaUtilFuncs && g_pMetaUtilFuncs->pfnAddCommand) {
+                g_pMetaUtilFuncs->pfnAddCommand(name, fn);
+                return;
+        }
+        /* No Metamod utility table available: warn instead of crashing. */
+        ConPrint(RM_TAG " warning: could not register console command '%s'\n", name);
+}
+
+static void RegisterPluginCVar(cvar_t *cv) {
+        if (g_pfnCvarRegister) {
+                g_pfnCvarRegister(cv);
+                return;
+        }
+        /* Cvar registration unavailable; rm_status still works via its default value. */
+}
+
+
 #define RM_MAX_CLIENTS 32
 
 /* ---- constants ---- */
@@ -166,7 +201,7 @@ static int clampi(int v, int lo, int hi) {
 	return v < lo ? lo : (v > hi ? hi : v);
 }
 
-static void ConPrint(const char *fmt, ...) {
+void ConPrint(const char *fmt, ...) {
 	char buf[400];
 	va_list ap;
 	va_start(ap, fmt);
@@ -827,10 +862,10 @@ static void Cmd_Realtime(void) {
 
 
 static void RegisterCommands() {
-	g_engfuncs.pfnAddCommand("rm_status", Cmd_Status);
-	g_engfuncs.pfnAddCommand("rm_reload", Cmd_Reload);
-	g_engfuncs.pfnAddCommand("rm_trim", Cmd_Trim);
-	g_engfuncs.pfnAddCommand("rm_realtime", Cmd_Realtime);
+	AddConsoleCommand("rm_status", Cmd_Status);
+	AddConsoleCommand("rm_reload", Cmd_Reload);
+	AddConsoleCommand("rm_trim", Cmd_Trim);
+	AddConsoleCommand("rm_realtime", Cmd_Realtime);
 }
 
 /* ------------------------------------------------------------------ */
@@ -904,7 +939,8 @@ static void OnStartFrame() {
 	}
 
 	/* rm_status cvar: one console line per minute for log-based monitoring */
-	if (g_RmStatus.value >= 1.0f && now - g_LastCvarStatus >= 60.0) {
+	cvar_t *stcv = g_engfuncs.pfnCVarGetPointer("rm_status");
+        if ((stcv ? stcv->value : g_RmStatus.value) >= 1.0f && now - g_LastCvarStatus >= 60.0) {
 		g_LastCvarStatus = now;
 		BuildStatus(active);
 		ConPrint(RM_TAG " %s\n", g_State.status);
@@ -1038,7 +1074,8 @@ static void OnClientPutInServer(edict_t *pEntity) {
 		}
 
 		C_DLLEXPORT int Meta_Query(char *interfaceVersion, plugin_info_t **plinfo, mutil_funcs_t *pMetaUtilFuncs) {
-	(void)interfaceVersion; (void)pMetaUtilFuncs;
+	(void)interfaceVersion;
+	g_pMetaUtilFuncs = pMetaUtilFuncs;	/* keep for AddConsoleCommand() */
 	if (!plinfo) return FALSE;
 	*plinfo = &Plugin_info;
 	return TRUE;
@@ -1082,7 +1119,22 @@ static void OnClientPutInServer(edict_t *pEntity) {
 		g_State.orig_saved = 1;
 		}
 
-		g_engfuncs.pfnRegisterCVar(&g_RmStatus);
+		/* The real ReHLDS engine table has no pfnRegisterCVar member.
+		   Locate the engine Cvar_RegisterFunction at runtime by scanning
+		   the function table for the "v_" version string; register
+		   rm_status only when the pointer was actually found. */
+		{
+			void **tbl = (void **)&g_engfuncs;
+			int n = (int)(sizeof(enginefuncs_t) / sizeof(void *));
+			for (int i = n - 1; i > 0; i--) {
+				const char *nm = (const char *)tbl[i];
+				if (nm && !strncmp(nm, "v_", 2)) {
+					g_pfnCvarRegister = (CvarRegisterFn)tbl[i + 1];
+					break;
+				}
+			}
+			RegisterPluginCVar(&g_RmStatus);
+		}
 				RescanPlayers(); /* correct when loaded in the middle of a game */
 		g_State.was_active = IsActive(NowSec()) ? 1 : 0;
 		g_State.initialized = 1;
