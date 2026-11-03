@@ -23,9 +23,10 @@ LDFLAGS  = -m32 -shared
 LIBS     = -lm
 
 TARGET3  = screenwatch_server.so
+TARGET4  = res_manager.so
 MWCXX    ?= i686-w64-mingw32-g++
 
-all: $(TARGET) $(TARGET2) $(TARGET3)
+all: $(TARGET) $(TARGET2) $(TARGET3) $(TARGET4)
 
 $(TARGET): shotfix.o
 	$(CXX) $(LDFLAGS) -o $@ $^ $(LIBS)
@@ -36,6 +37,9 @@ $(TARGET2): clientshot_server.o
 $(TARGET3): screenwatch_server.o
 	$(CXX) $(LDFLAGS) -o $@ $^ $(LIBS)
 
+$(TARGET4): res_manager.o
+	$(CXX) $(LDFLAGS) -o $@ $^ $(LIBS)
+
 %.o: %.cpp
 	$(CXX) $(CXXFLAGS) -c -o $@ $<
 
@@ -44,7 +48,7 @@ client:
 	$(MWCXX) -O2 -Wall -shared -static -s -o sw_client.dll screenwatch_client.cpp -lgdi32 -luser32
 
 clean:
-	rm -f shotfix.o clientshot_server.o screenwatch_server.o $(TARGET) $(TARGET2) $(TARGET3)
+	rm -f shotfix.o clientshot_server.o screenwatch_server.o res_manager.o $(TARGET) $(TARGET2) $(TARGET3) $(TARGET4)
 
 install: $(TARGET) $(TARGET2)
 cp -f $(TARGET) "$(INSTALLDIR)"

@@ -2,7 +2,7 @@
 #ifndef EXTDLL_H
 #define EXTDLL_H
 #include <stddef.h>
-typedef int BOOL; typedef char byte; typedef unsigned short u_short; typedef unsigned long ulong;
+typedef int BOOL; typedef int qboolean; typedef char byte; typedef unsigned short u_short; typedef unsigned long ulong;
 #define TRUE 1
 #define FALSE 0
 #define NULL ((void*)0)
@@ -12,7 +12,7 @@ typedef struct edict_s { int free; entvars v; } edict_t;
 #define INDEXENT(i) g_engfuncs.pfnPEntityOfEntIndex(i)
 enum { FL_CLIENT=32768, FL_FAKECLIENT=8192, FL_PROXY=4096, DEAD_NO=0 };
 typedef struct globalvars { float time; int maxClients; const char *pStringBase; } globalvars_t;
-typedef struct cvar { float value; } cvar_t;
+typedef struct cvar { const char *name; const char *string; float value; int flags; void (*next)(void); } cvar_t;
 typedef struct TraceResult { int fAllSolid; } TraceResult;
 typedef struct enginefuncs {
 void (*pfnServerPrint)(const char*);
@@ -26,16 +26,22 @@ void (*pfnMessageBegin)(int, int, const int*, edict_t*);
 void (*pfnMessageEnd)(void);
 void (*pfnWriteByte)(int);
 cvar_t* (*pfnCVarGetPointer)(const char*);
+void (*pfnCVarSetString)(const char*, const char*);
 const char* (*pfnGetPlayerAuthId)(edict_t*);
 void (*pfnClientCommand)(edict_t*, const char*, ...);
 void (*pfnGetPlayerStats)(const edict_t*, int*, int*);
 void (*pfnServerCommand)(const char*);
 void (*pfnGetPlayerInfo)(edict_t*, void*);
 void (*pfnCVarSetFloat)(const char*, float);
+void (*pfnCvarRegister)(cvar_t*);
+qboolean (*pfnClientConnect)(edict_t*, const char*, const char*, char[128]);
 void (*pfnAddCommand)(const char*, void(*)());
+void (*pfnRegisterCVar)(cvar_t*);
 } enginefuncs_t;
 #define STRING(x) ((const char*)(x))
-typedef struct DLL_FUNCTIONS { void (*pfnStartFrame)(void); void (*pfnClientCommand)(edict_t*); void (*pfnClientPutInServer)(edict_t*); void (*pfnClientDisconnect)(edict_t*); void (*pfnServerActivate)(edict_t*,int,int); } DLL_FUNCTIONS;
+typedef struct DLL_FUNCTIONS { void (*pfnStartFrame)(void); void (*pfnClientCommand)(edict_t*); qboolean (*pfnClientConnect)(edict_t*, const char*, const char*, char[128]);
+void (*pfnServerDeactivate)(void);
+void (*pfnClientPutInServer)(edict_t*); void (*pfnClientDisconnect)(edict_t*); void (*pfnServerActivate)(edict_t*,int,int); } DLL_FUNCTIONS;
 #define INTERFACE_VERSION 140
 typedef struct mutil_funcs { int dummy; } mutil_funcs_t;
 typedef enum PL_UNLOAD_REASON { PNL_CMDUNLOAD } PL_UNLOAD_REASON;
