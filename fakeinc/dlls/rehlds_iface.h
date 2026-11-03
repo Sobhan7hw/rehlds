@@ -4,8 +4,10 @@
 #include <stddef.h>
 typedef struct sizebuf_s { const char *buffername; unsigned char *data; int maxsize; int cursize; int flags; } sizebuf_t;
 class IGameClient { public: virtual bool IsActive(); virtual edict_t* GetEdict(); };
-class IRehldsHook_SV_EmitPings { public: virtual void callNext(IGameClient*, sizebuf_t*); };
-class IRehldsHookchains { public: virtual IRehldsHook_SV_EmitPings* SV_EmitPings(); };
+template <typename RET, typename... A> class IHookChain { public: virtual void callNext(A...) {} };
+template <typename RET, typename... A> class IHookChainRegistry { public: virtual void addHook(void (*fn)(IHookChain<RET, A...>*, A...)); virtual void removeHook(void (*fn)(IHookChain<RET, A...>*, A...)); };
+typedef IHookChainRegistry<void, IGameClient *, sizebuf_t *> IRehldsHookRegistry_SV_EmitPings;
+class IRehldsHookchains { public: virtual IRehldsHookRegistry_SV_EmitPings* SV_EmitPings(); };
 struct RehldsFuncs_t {
 void (*MSG_WriteByte)(sizebuf_t*, int);
 void (*MSG_StartBitWriting)(sizebuf_t*);

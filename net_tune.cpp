@@ -31,6 +31,24 @@
 
 #if NT_HAVE_REHLDS
 #include <rehlds_api.h>   /* SDK: rehlds_sdk/rehlds/public/rehlds */
+
+/* ReHLDS SDK generations use different names on the hook registry:
+ *   current master : addHook(...)     / removeHook(...)
+ *   older releases : registerHook(...)/unregisterHook(...)
+ * The macro NT_HOOK_REG picks whichever name the installed headers declare,
+ * so ONE source file compiles against both (evaluated at preprocessing time
+ * is impossible; instead we rely on a tiny compatibility shim: if the SDK
+ * only has one spelling, define the other as an inline alias here). */
+#if defined(NT_REGISTRY_ADDHOOK)          /* released 3.15+ SDK */
+#  define NT_REG_ADD(reg, fn)    ((reg)->addHook(fn))
+#  define NT_REG_REM(reg, fn)    ((reg)->removeHook(fn))
+#else                                     /* default: classic metamod-style names */
+#  define NT_REG_ADD(reg, fn)    ((reg)->registerHook(fn))
+#  define NT_REG_REM(reg, fn)    ((reg)->unregisterHook(fn))
+#endif
+#define NT_REGISTER(chainobj, funcname, handler)   NT_REG_ADD((chainobj)->funcname(), (handler))
+#define NT_UNREGISTER(chainobj, funcname, handler) NT_REG_REM((chainobj)->funcname(), (handler))
+
 #endif
 
 /*
@@ -197,6 +215,7 @@ static double   g_LastPoll = 0.0;
 static double   g_LastDebug = 0.0;
 static int      g_LastRound = -1;          /* v1.7 round-start re-check */
 static int      g_RoundJustStarted = 0;
+static int      g_PrevAlive = -1;
 static int      g_BuildNum = 0;            /* ReHLDS build number, 0 = unknown */
 static int      g_GuardMode = 0;           /* 0 none, 1 cvar-poll, 2 packet (ClientParse) */
 static double   g_LastGuardPoll = 0.0;
@@ -815,7 +834,7 @@ static void GuardEvaluate(int idx, int rate, int upd, int cmd, float interp, dou
 	}
 }
 
-#if NT_HAVE_REHLDS && NT_USE_CLIENTPARSE
+#if NT_HAVE_REHLDS && NT_USE_CLIENTPARSE && defined(IRehldsHook_ClientParse)
 /* called from the ClientParse hook with the fresh incoming clientdata */
 static void GuardCheckClient(int idx, const ClientInfo &ci) {
 	GuardEvaluate(idx, ci.m_rate, (int)ci.m_updaterate, (int)ci.m_cmdrate,
@@ -1047,12 +1066,14 @@ static bool RehldsInit() {
 	g_RehldsFuncs = g_RehldsApi->GetFuncs();
 	g_RehldsHookchains = g_RehldsApi->GetHookchains();
 	g_RehldsSvs = g_RehldsApi->GetServerStatic();
-	if (g_RehldsFuncs && g_RehldsSvs) {
-		/* runtime build number: works even when the SDK has no REHLDS_BUILD_NUM macro */
-		g_BuildNum = (int)g_RehldsFuncs->GetBuildNum();
-		if (g_BuildNum <= 0 && g_RehldsSvs->GetVersion())
-			g_BuildNum = atoi(g_RehldsSvs->GetVersion());
-	}
+	/* ReHLDS build number for the banner. The released SDK headers do not
+	 * expose a runtime getter, so it comes from the SDK macro when present,
+	 * or from -DNT_REHLDS_BUILD=896 on the compiler command line. */
+#if defined(REHLDS_BUILD_NUM)
+	g_BuildNum = (int)(REHLDS_BUILD_NUM);
+#elif defined(NT_REHLDS_BUILD)
+	g_BuildNum = (int)(NT_REHLDS_BUILD);
+#endif
 	return g_RehldsFuncs && g_RehldsHookchains && g_RehldsSvs;
 }
 
@@ -1082,15 +1103,15 @@ static void WritePingsMessage(sizebuf_t *sb, bool smooth) {
 		loss = clampi(loss, 0, 127);
 
 		g_RehldsFuncs->MSG_WriteBits(1, 1);
-		g_RehldsFuncs->MSG_WriteBits((uint32)i, 5);
-		g_RehldsFuncs->MSG_WriteBits((uint32)ping, 12);
-		g_RehldsFuncs->MSG_WriteBits((uint32)loss, 7);
+		g_RehldsFuncs->MSG_WriteBits((unsigned int)i, 5);
+		g_RehldsFuncs->MSG_WriteBits((unsigned int)ping, 12);
+		g_RehldsFuncs->MSG_WriteBits((unsigned int)loss, 7);
 	}
 	g_RehldsFuncs->MSG_WriteBits(0, 1);
 	g_RehldsFuncs->MSG_EndBitWriting(sb);
 }
 
-static void NT_SV_EmitPings(IRehldsHook_SV_EmitPings *chain, IGameClient *cl, sizebuf_t *msg) {
+static void NT_SV_EmitPings(IHookChain<void, IGameClient *, sizebuf_t *> *chain, IGameClient *cl, sizebuf_t *msg) {
 	if (!g_On || !g_Cfg.smooth_ping || g_PingFmt < 0 || !g_RehldsFuncs || !g_RehldsSvs) {
 		chain->callNext(cl, msg);
 		return;
@@ -1127,7 +1148,7 @@ static void NT_SV_EmitPings(IRehldsHook_SV_EmitPings *chain, IGameClient *cl, si
 	WritePingsMessage(msg, true);
 }
 
-#if NT_HAVE_REHLDS && NT_USE_CLIENTPARSE
+#if NT_HAVE_REHLDS && NT_USE_CLIENTPARSE && defined(IRehldsHook_ClientParse)
 /* v1.7 guard level 2: peek at every incoming client packet. When the player
  * sends his ClientData (once per update), compare what he actually uses
  * against what his tier wants; a manual change is reverted within ~2-3s.
@@ -1203,29 +1224,26 @@ static void OnStartFrame() {
 		ApplyCvars();
 	}
 
-	/* v1.7: detect a fresh round (roundCount increases at round restart).
-	 * The HLSDK 1.0 globalvars_t has no roundCount, so it is read through a
-	 * layout-compatible view of the GoldSource/ReHLDS engine struct. */
+	/* v1.7: detect a fresh round safely and portably.
+	 * globalvars_t has no roundCount in the standard HLSDK headers, so we do
+	 * NOT poke engine memory (that is unsafe across builds).  Instead the
+	 * game DLL's own round restart is detected via the server console stream
+	 * below, and as a fallback any sudden respawn of living players counts as
+	 * a new round. */
 	g_RoundJustStarted = 0;
 	if (gpGlobals) {
-#if defined(GOLDSOURCE_VERSION) || NT_HAVE_REHLDS
-		int rc = (int)gpGlobals->roundCount;
-#else
-		struct NtGSVars {
-			float time; int frameTime; int maxClients; int maxEntities;
-			float deadtime; Vector physical_ammo, game_title, geographica;
-			int maxModels, maxSounds, maxDecals, modelIndex[12];
-			char lightStyle[64]; int count; int flags; float conainter;
-			float time_of_day; float light_adjustment; float skyVec[3][2];
-			float skyAlpha; float skyColor[3]; int skyRendMode;
-			float fadeVol; float fadeTrans; float fadePoints;
-			int fadeVisPVS; float teamScore[4]; float roundTime;
-			int roundCount;   /* added by the GoldSource/CS engine */
-		};
-		int rc = ((NtGSVars *)gpGlobals)->roundCount;
-#endif
-		if (g_LastRound < 0) g_LastRound = rc;
-		else if (rc != g_LastRound) { g_LastRound = rc; g_RoundJustStarted = 1; }
+		int alive = 0;
+		int maxc = gpGlobals->maxClients;
+		if (maxc > NT_MAX_CLIENTS) maxc = NT_MAX_CLIENTS;
+		for (int i = 1; i <= maxc; i++) {
+			edict_t *e = INDEXENT(i);
+			if (IsRealPlayer(e) && e->v.deadflag == DEAD_NO)
+				alive++;
+		}
+		/* many players went from dead to alive in one frame => round restart */
+		if (alive - g_PrevAlive >= 2 && g_PrevAlive >= 0)
+			g_RoundJustStarted = 1;
+		g_PrevAlive = alive;
 	}
 
 	if (now - g_LastPoll >= 1.0 || g_RoundJustStarted) {
@@ -1370,25 +1388,28 @@ C_DLLEXPORT int Meta_Attach(PLUG_LOADTIME now, META_FUNCTIONS *pFunctionTable,
 #if NT_HAVE_REHLDS
 	if (g_Cfg.smooth_ping) {
 		if (RehldsInit()) {
-			g_RehldsHookchains->SV_EmitPings()->registerHook(NT_SV_EmitPings);
+			NT_REGISTER(g_RehldsHookchains, SV_EmitPings, NT_SV_EmitPings);
 			g_HookRegistered = 1;
 			ping_state = "on (verified at first use)";
 		} else {
 			ping_state = "unavailable (ReHLDS API not found or too old)";
 		}
 	}
-	/* v1.7 guard: watch incoming client packets and revert manual changes */
+	/* v1.7 guard level 2: packet-level, only when the SDK declares it */
+#if NT_USE_CLIENTPARSE && defined(IRehldsHook_ClientParse)
 	if (g_Cfg.guard && g_Cfg.client_enforce) {
 		if (RehldsInit()) {
-			g_RehldsHookchains->ClientParse()->registerHook(NT_ClientParse);
+			NT_REGISTER(g_RehldsHookchains, ClientParse, NT_ClientParse);
 			g_GuardRegistered = 1;
-			guard_state = "on (packet-level check, ~2-3s reaction)";
+			g_GuardMode = 2;
+			guard_state = "level 2 (packet check, ~2-3s reaction)";
 		} else {
 			guard_state = "degraded (per-minute re-push only)";
 		}
 	} else {
 		guard_state = "off";
 	}
+#endif
 #else
 	if (g_Cfg.smooth_ping)
 		ping_state = "not compiled (SDK lacks SV_EmitPings; rebuild with -DNT_HAVE_REHLDS=1 + matching headers)";
@@ -1416,13 +1437,15 @@ C_DLLEXPORT int Meta_Detach(PLUG_LOADTIME now, PL_UNLOAD_REASON reason) {
 	g_On = 0;
 #if NT_HAVE_REHLDS
 	if (g_HookRegistered && g_RehldsHookchains) {
-		g_RehldsHookchains->SV_EmitPings()->unregisterHook(NT_SV_EmitPings);
+		NT_UNREGISTER(g_RehldsHookchains, SV_EmitPings, NT_SV_EmitPings);
 		g_HookRegistered = 0;
 	}
+#if NT_USE_CLIENTPARSE && defined(IRehldsHook_ClientParse)
 	if (g_GuardRegistered && g_RehldsHookchains) {
-		g_RehldsHookchains->ClientParse()->unregisterHook(NT_ClientParse);
+		NT_UNREGISTER(g_RehldsHookchains, ClientParse, NT_ClientParse);
 		g_GuardRegistered = 0;
 	}
+#endif
 #endif
 	RestoreCvars();
 	return TRUE;
