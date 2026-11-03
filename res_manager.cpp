@@ -39,16 +39,17 @@ globalvars_t *gpGlobals = NULL;
 meta_globals_t *gpMetaGlobals = NULL;
 gamedll_funcs_t *gpGamedllFuncs = NULL;
 
-/* rm_status: 0 = silent, 1 = print a status line to console every 60s */
-static cvar_t g_RmStatus = { "rm_status", "0", 0, 0, NULL };
+/* rm_status: 0 = silent, 1 = print a status line to console every 60s.
+ * NOTE: the real HLSDK declares cvar_t::name/::string as plain char*, so we
+ * cast the literals to silence the -Wwrite-strings warning. */
+static cvar_t g_RmStatus = { (char *)"rm_status", (char *)"0", 0, 0, NULL };
 
 /*
- * Real HLSDK/ReHLDS enginefuncs_t has NO pfnAddCommand / pfnRegisterCVar.
- * Console commands must be added through the Metamod utility table
- * (mutil_funcs_t::pfnAddCommand), and cvars are registered through
- * pfnCvar_Register (note the underscore).  These thin wrappers keep the
- * plugin compiling and working against both the real SDK and the minimal
- * stand-in headers used for syntax checks.
+ * The real ReHLDS enginefuncs_t layout is versioned: members that newer
+ * plugins use (like pfnAddCommand or pfnCvar_Register) may sit BEYOND the
+ * end of the table copy that an older engine actually fills in.  Writing or
+ * calling blindly there corrupts memory, so we only touch engine functions
+ * whose offset lies inside the bytes the engine really provided.
  */
 #define RM_TAG "[RM]"
 
@@ -57,15 +58,51 @@ typedef void (*CvarRegisterFn)(cvar_t *);
 
 void ConPrint(const char *fmt, ...);   /* defined below */
 
-static mutil_funcs_t *g_pMetaUtilFuncs = NULL;
-static CvarRegisterFn g_pfnCvarRegister = NULL;
+/* Raw pointer received from Meta_Query (mutil_funcs_t::pfnAddCommand). */
+static void *(*g_pMutilAddCommand)(const char *, void (*)()) = NULL;
+
+/* Engine function tables, captured verbatim with their real size. */
+static const unsigned char *g_pEngTable = NULL;
+static int g_cbEngTable = 0;
+
+/* Resolved at runtime from the engine's own table image: */
+static CvarRegisterFn      g_pfnCvarRegister = NULL;  /* pfnCvar_Register */
+static void (*g_pfnAddCommand)(const char *, void (*)()) = NULL;
+
+/* Return the function pointer stored at byte offset `off` in the engine
+ * table image, but only if that offset lies within the region the engine
+ * actually initialized (bounded by the trailing "v_" version string). */
+static void *EngineFnAt(int off) {
+        if (!g_pEngTable || g_cbEngTable <= 0) return NULL;
+        if (off < 0 || off + (int)sizeof(void *) > g_cbEngTable) return NULL;
+        void *fn;
+        memcpy(&fn, g_pEngTable + off, sizeof(fn));
+        return fn;
+}
+
+static int EngOffsetOf(const char *member) {
+        return (int)((size_t)&((enginefuncs_t *)0)->member);
+}
+
+static void ResolveEngineFns() {
+        /* pfnCvar_Register lives just before pfnCVarGetPointer in HLSDK. */
+        g_pfnCvarRegister = (CvarRegisterFn)
+                EngineFnAt(EngOffsetOf(pfnCVarGetPointer) - (int)sizeof(void *));
+        g_pfnAddCommand = (void (*)(const char *, void (*)()))
+                EngineFnAt(EngOffsetOf(pfnAddCommand));
+}
 
 static void AddConsoleCommand(const char *name, CmdFunction fn) {
-        if (g_pMetaUtilFuncs && g_pMetaUtilFuncs->pfnAddCommand) {
-                g_pMetaUtilFuncs->pfnAddCommand(name, fn);
+        /* Preferred: Metamod's own utility table. */
+        if (g_pMutilAddCommand) {
+                g_pMutilAddCommand(name, fn);
                 return;
         }
-        /* No Metamod utility table available: warn instead of crashing. */
+        /* Fallback: the engine's AddCommand, only when safely present. */
+        if (g_pfnAddCommand) {
+                g_pfnAddCommand(name, fn);
+                return;
+        }
         ConPrint(RM_TAG " warning: could not register console command '%s'\n", name);
 }
 
@@ -1071,11 +1108,34 @@ static void OnClientPutInServer(edict_t *pEntity) {
 		C_DLLEXPORT void GiveFnptrsToDll(enginefuncs_t *pengfuncs, globalvars_t *pGlobals) {
 		memcpy(&g_engfuncs, pengfuncs, sizeof(enginefuncs_t));
 		gpGlobals = pGlobals;
+
+		/* Keep a pointer to the engine's OWN table image and measure how many
+		 * bytes the engine actually initialized: the HLSDK function table is
+		 * terminated by a "v_..." version string pointer in the slot right
+		 * after the last valid function.  Anything beyond that region is
+		 * uninitialized garbage and must never be called. */
+		g_pEngTable = (const unsigned char *)pengfuncs;
+		{
+			const unsigned char *p = g_pEngTable;
+			int maxBytes = (int)sizeof(enginefuncs_t) + (int)sizeof(void *);
+			int found = -1;
+			for (int off = 0; off + (int)sizeof(void *) <= maxBytes; off += (int)sizeof(void *)) {
+				void *slot;
+				memcpy(&slot, p + off, sizeof(slot));
+				const char *nm = (const char *)slot;
+				if (nm && !strncmp(nm, "v_", 2)) { found = off; break; }
+			}
+			g_cbEngTable = (found >= 0) ? found : (int)sizeof(enginefuncs_t);
+		}
+		ResolveEngineFns();
 		}
 
 		C_DLLEXPORT int Meta_Query(char *interfaceVersion, plugin_info_t **plinfo, mutil_funcs_t *pMetaUtilFuncs) {
 	(void)interfaceVersion;
-	g_pMetaUtilFuncs = pMetaUtilFuncs;	/* keep for AddConsoleCommand() */
+	/* Keep only the first entry point (pfnAddCommand) as a raw pointer;
+	 * reading whole structs of unknown size is unsafe across versions. */
+	if (pMetaUtilFuncs)
+		memcpy(&g_pMutilAddCommand, pMetaUtilFuncs, sizeof(g_pMutilAddCommand));
 	if (!plinfo) return FALSE;
 	*plinfo = &Plugin_info;
 	return TRUE;
@@ -1119,23 +1179,11 @@ static void OnClientPutInServer(edict_t *pEntity) {
 		g_State.orig_saved = 1;
 		}
 
-		/* The real ReHLDS engine table has no pfnRegisterCVar member.
-		   Locate the engine Cvar_RegisterFunction at runtime by scanning
-		   the function table for the "v_" version string; register
-		   rm_status only when the pointer was actually found. */
-		{
-			void **tbl = (void **)&g_engfuncs;
-			int n = (int)(sizeof(enginefuncs_t) / sizeof(void *));
-			for (int i = n - 1; i > 0; i--) {
-				const char *nm = (const char *)tbl[i];
-				if (nm && !strncmp(nm, "v_", 2)) {
-					g_pfnCvarRegister = (CvarRegisterFn)tbl[i + 1];
-					break;
-				}
-			}
-			RegisterPluginCVar(&g_RmStatus);
-		}
-				RescanPlayers(); /* correct when loaded in the middle of a game */
+		/* rm_status cvar registration: only through the safely resolved
+                   pfnCvar_Register pointer (bounded by the engine's own
+                   initialized table region, see GiveFnptrsToDll). */
+                RegisterPluginCVar(&g_RmStatus);
+                             RescanPlayers(); /* correct when loaded in the middle of a game */
 		g_State.was_active = IsActive(NowSec()) ? 1 : 0;
 		g_State.initialized = 1;
 				RegisterCommands();

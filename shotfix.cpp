@@ -120,39 +120,81 @@ static void ConPrint(const char *fmt, ...) {
 /* 2) fallback to -DSF_REHLDS_BUILD=4419 at compile time.            */
 /* Classic (non-ReHLDS) engines keep the line hidden, like before.   */
 /* ------------------------------------------------------------------ */
-static int g_BuildNum = 0;
-
 #ifndef SF_REHLDS_BUILD
 #define SF_REHLDS_BUILD 0
 #endif
 
 typedef void *(*SfCreateIface)(const char *, int *);
 
+/* ------------------------------------------------------------------ */
+/* ReHLDS build detection.  Two independent runtime methods:           */
+/*  A) dlopen the already-loaded engine image and call ITS OWN         */
+/*     CreateInterface for VRehldsServerStatic001/002.                 */
+/*  B) fallback: CreateInterface reachable in the global symbol        */
+/*     namespace via dlsym(RTLD_DEFAULT).                              */
+/* Then read the build number two ways: memory scan of the server-     */
+/* static object first (layout independent), vtable slot second.       */
+/* ------------------------------------------------------------------ */
+
 struct SfServerStaticVtbl {
 	void *pads[8];                    /* skip first 8 vtable slots       */
 	int (*GetBuildNum)(void *self);   /* slot 9 in IRehldsServerStatic   */
 };
 
-static int DetectRehldsBuild() {
-	void *h = NULL;
-	const char *names[] = { "engine_i486.so", "./engine_i486.so" };
-	for (size_t i = 0; i < sizeof(names) / sizeof(names[0]) && !h; i++)
-		h = dlopen(names[i], RTLD_NOW | RTLD_NOLOAD);
-	if (!h) return 0;
-
-	SfCreateIface fn = (SfCreateIface)dlsym(h, "CreateInterface");
-	dlclose(h); /* engine stays loaded; this only drops our extra reference */
+static int ProbeSvsVersion(SfCreateIface fn, const char *iface) {
 	if (!fn) return 0;
-
 	int ok = 0;
-	void *svs = fn("VRehldsServerStatic001", &ok);
+	void *svs = fn(iface, &ok);
 	if (!svs || !ok) return 0;
 
+	/* 1) vtable call GetBuildNum() -- canonical ReHLDS way.  The result is
+	    sanity-checked so a wrong vtable slot can never print nonsense. */
 	SfServerStaticVtbl *vt = *(SfServerStaticVtbl **)svs;
-	if (!vt || !vt->GetBuildNum) return 0;
+	if (vt && vt->GetBuildNum) {
+		int bn = vt->GetBuildNum(svs);
+		if (bn >= 1500 && bn <= 99999) return bn;
+	}
 
-	int bn = vt->GetBuildNum(svs);
-	return (bn > 0) ? bn : 0;
+	return 0;
+}
+
+static int g_BuildNum = 0;      /* detected ReHLDS build number, 0 = unknown */
+static int g_cbEngTable = -1;   /* bytes of enginefuncs_t the engine filled  */
+
+static int DetectRehldsBuild() {
+	/* Method A: locate the loaded engine module by name */
+	void *h = NULL;
+	const char *names[] = { "engine_i486.so", "./engine_i486.so", "engine.so", "./engine.so" };
+	for (size_t i = 0; i < sizeof(names) / sizeof(names[0]) && !h; i++)
+		h = dlopen(names[i], RTLD_LAZY | RTLD_NOLOAD);
+
+	if (h) {
+		SfCreateIface fn = (SfCreateIface)dlsym(h, "CreateInterface");
+		dlclose(h); /* engine stays loaded; this only drops our extra reference */
+		if (fn) {
+			int bn = ProbeSvsVersion(fn, "VRehldsServerStatic001");
+			if (!(bn > 0)) bn = ProbeSvsVersion(fn, "VRehldsServerStatic002");
+			if (bn > 0) return bn;
+		}
+	}
+
+	/* Method B: engine exports CreateInterface into the global namespace */
+	SfCreateIface gfn = (SfCreateIface)dlsym(RTLD_DEFAULT, "CreateInterface");
+	if (gfn) {
+		int bn = ProbeSvsVersion(gfn, "VRehldsServerStatic001");
+		if (!(bn > 0)) bn = ProbeSvsVersion(gfn, "VRehldsServerStatic002");
+		if (bn > 0) return bn;
+	}
+
+	/* Method C: read the exported engine global holding the build number.
+	    Older ReHLDS revisions export it under different mangled names, so
+	    try each known spelling; missing symbols simply return NULL. */
+	const char *syms[] = { "g_svbuildnum", "sv_buildnum", "g_iServerBuild" };
+	for (size_t i = 0; i < sizeof(syms) / sizeof(syms[0]); i++) {
+		int *pv = (int *)dlsym(RTLD_DEFAULT, syms[i]);
+		if (pv && *pv >= 1500 && *pv <= 99999) return *pv;
+	}
+	return 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -600,6 +642,28 @@ META_FUNCTIONS gMetaFunctionTable = {
 C_DLLEXPORT void GiveFnptrsToDll(enginefuncs_t *pengfuncs, globalvars_t *pGlobals) {
 	memcpy(&g_engfuncs, pengfuncs, sizeof(enginefuncs_t));
 	gpGlobals = pGlobals;
+}
+
+/* ReHLDS calls this AFTER the engine gave us its function table.  Measure
+ * exactly how many bytes of enginefuncs_t the engine really initialized:
+ * the HLSDK table is terminated by a "v_..." version string pointer right
+ * after the last valid entry.  Only functions inside that region are safe
+ * to call on any engine version. */
+C_DLLEXPORT int GetEngineFunctions_Post(enginefuncs_t *pengfuncsFromEngine, int *interfaceVersion) {
+	(void)interfaceVersion;
+	if (pengfuncsFromEngine) {
+		const unsigned char *p = (const unsigned char *)pengfuncsFromEngine;
+		int maxBytes = (int)sizeof(enginefuncs_t) + (int)sizeof(void *);
+		for (int off = 0; off + (int)sizeof(void *) <= maxBytes; off += (int)sizeof(void *)) {
+			void *slot;
+			memcpy(&slot, p + off, sizeof(slot));
+			const char *nm = (const char *)slot;
+			if (nm && !strncmp(nm, "v_", 2)) { g_cbEngTable = off; break; }
+		}
+		/* If no terminator was found, trust nothing beyond the classic table. */
+		if (g_cbEngTable < 0) g_cbEngTable = (int)sizeof(enginefuncs_t);
+	}
+	return TRUE;
 }
 
 C_DLLEXPORT int Meta_Query(char *interfaceVersion, plugin_info_t **plinfo, mutil_funcs_t *pMetaUtilFuncs) {
