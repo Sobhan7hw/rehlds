@@ -290,8 +290,8 @@ C_DLLEXPORT void GiveFnptrsToDll(enginefuncs_t *peng,globalvars_t *pg){
 memcpy(&g_engfuncs,peng,sizeof(enginefuncs_t)); gpGlobals=pg;
 }
 C_DLLEXPORT int Meta_Query(char *iv,plugin_info_t **pi,mutil_funcs_t *mu){
-(void)mu;
-if(!iv||strcmp(iv,META_INTERFACE_VERSION)!=0) return FALSE;
+(void)iv;(void)mu;
+if(!pi) return FALSE;
 *pi=&Plugin_info; return TRUE;
 }
 C_DLLEXPORT int GetEntityAPI2(DLL_FUNCTIONS*t,int*v){

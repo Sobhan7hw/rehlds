@@ -611,8 +611,8 @@ C_DLLEXPORT void GiveFnptrsToDll(enginefuncs_t *pengfuncs, globalvars_t *pGlobal
 }
 
 C_DLLEXPORT int Meta_Query(char *interfaceVersion, plugin_info_t **plinfo, mutil_funcs_t *pMetaUtilFuncs) {
-	if (!interfaceVersion || !plinfo) return FALSE;
-	if (strcmp(interfaceVersion, META_INTERFACE_VERSION) != 0) return FALSE;
+	(void)interfaceVersion;
+	if (!plinfo) return FALSE;
 	*plinfo = &Plugin_info;
 	g_pMetaUtil = pMetaUtilFuncs;
 	return TRUE;
