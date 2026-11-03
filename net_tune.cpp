@@ -118,6 +118,7 @@ struct NtSettings {
 	float recheck_minutes;    /* full re-evaluate/re-push interval (minutes) */
 
 	int   debug;
+	int   quiet;              /* 1 = only the short banner on load */
 } g_Cfg;
 
 struct Slot {
@@ -174,6 +175,7 @@ static double   g_LastPoll = 0.0;
 static double   g_LastDebug = 0.0;
 static int      g_LastRound = -1;          /* v1.7 round-start re-check */
 static int      g_RoundJustStarted = 0;
+static int      g_BuildNum = 0;              /* ReHLDS build number, 0 = unknown */
 
 /* ------------------------------------------------------------------ */
 /* Helpers                                                             */
@@ -290,6 +292,7 @@ static int try_load_config(const char *path) {
 		else if (strcmp(key, "guard_cooldown") == 0)          g_Cfg.guard_cooldown = (float)atof(val);
 		else if (strcmp(key, "recheck_minutes") == 0)         g_Cfg.recheck_minutes = (float)atof(val);
 		else if (strcmp(key, "debug") == 0)                  g_Cfg.debug = atoi(val);
+		else if (strcmp(key, "quiet") == 0)                  g_Cfg.quiet = atoi(val);
 		else ParseTierKey(key, val);
 	}
 	fclose(f);
@@ -355,6 +358,7 @@ static void SetDefaults() {
 	g_Cfg.recheck_minutes = 1.0f;
 
 	g_Cfg.debug = 0;
+	g_Cfg.quiet = 1;
 }
 
 static void ClampConfig() {
@@ -943,6 +947,12 @@ static bool RehldsInit() {
 	g_RehldsFuncs = g_RehldsApi->GetFuncs();
 	g_RehldsHookchains = g_RehldsApi->GetHookchains();
 	g_RehldsSvs = g_RehldsApi->GetServerStatic();
+	if (g_RehldsFuncs && g_RehldsSvs) {
+		/* runtime build number: works even when the SDK has no REHLDS_BUILD_NUM macro */
+		g_BuildNum = (int)g_RehldsFuncs->GetBuildNum();
+		if (g_BuildNum <= 0 && g_RehldsSvs->GetVersion())
+			g_BuildNum = atoi(g_RehldsSvs->GetVersion());
+	}
 	return g_RehldsFuncs && g_RehldsHookchains && g_RehldsSvs;
 }
 
@@ -1255,9 +1265,18 @@ C_DLLEXPORT int Meta_Attach(PLUG_LOADTIME now, META_FUNCTIONS *pFunctionTable,
 
 	g_On = 1;
 
-	ConPrint(NT_TAG " v1.7 loaded (%s): auto_tune=%d start_tier=%d rate=%d max_ping=%d ping_smoothing=%s guard=%s\n",
-			 found ? g_CfgPath : "no ini, defaults",
-		  g_Cfg.auto_tune, g_Cfg.start_tier, g_Cfg.cl_rate, g_Cfg.max_ping, ping_state, guard_state);
+	/* load banner, ReAuthCheck style */
+	ConPrint(NT_TAG " Version: %s Linux 'Counter-Strike 1.6'\n", Plugin_info.version);
+	ConPrint(NT_TAG " Success: Configuration executed%s.\n",
+			 found ? "" : " (no ini file, defaults in use)");
+#if NT_HAVE_REHLDS
+	if (g_BuildNum > 0)
+		ConPrint(NT_TAG " Success: Build ReHLDS version defined Linux '%d'\n", g_BuildNum);
+#endif
+	if (!g_Cfg.quiet) {
+		ConPrint(NT_TAG " Detail: auto_tune=%d start_tier=%d rate=%d max_ping=%d smoothing=%s guard=%s\n",
+				  g_Cfg.auto_tune, g_Cfg.start_tier, g_Cfg.cl_rate, g_Cfg.max_ping, ping_state, guard_state);
+	}
 
 	return TRUE;
 }
