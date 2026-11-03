@@ -6,6 +6,7 @@
 #include <string.h>
 #include <math.h>
 #include <time.h>
+#include <dlfcn.h>
 #include <sys/stat.h>
 
 /*
@@ -108,6 +109,50 @@ static void ConPrint(const char *fmt, ...) {
 	vsnprintf(buf, sizeof(buf), fmt, ap);
 	va_end(ap);
 	g_engfuncs.pfnServerPrint(buf);
+}
+
+/* ------------------------------------------------------------------ */
+/* ReHLDS build number for the banner                                  */
+/*                                                                     */
+/* 1) runtime getter: asks the loaded engine for                     */
+/*    IRehldsServerStatic::GetBuildNum (works on any ReHLDS build,   */
+/*    no compile flags needed);                                      */
+/* 2) fallback to -DSF_REHLDS_BUILD=4419 at compile time.            */
+/* Classic (non-ReHLDS) engines keep the line hidden, like before.   */
+/* ------------------------------------------------------------------ */
+static int g_BuildNum = 0;
+
+#ifndef SF_REHLDS_BUILD
+#define SF_REHLDS_BUILD 0
+#endif
+
+typedef void *(*SfCreateIface)(const char *, int *);
+
+struct SfServerStaticVtbl {
+	void *pads[8];                    /* skip first 8 vtable slots       */
+	int (*GetBuildNum)(void *self);   /* slot 9 in IRehldsServerStatic   */
+};
+
+static int DetectRehldsBuild() {
+	void *h = NULL;
+	const char *names[] = { "engine_i486.so", "./engine_i486.so" };
+	for (size_t i = 0; i < sizeof(names) / sizeof(names[0]) && !h; i++)
+		h = dlopen(names[i], RTLD_NOW | RTLD_NOLOAD);
+	if (!h) return 0;
+
+	SfCreateIface fn = (SfCreateIface)dlsym(h, "CreateInterface");
+	dlclose(h); /* engine stays loaded; this only drops our extra reference */
+	if (!fn) return 0;
+
+	int ok = 0;
+	void *svs = fn("VRehldsServerStatic001", &ok);
+	if (!svs || !ok) return 0;
+
+	SfServerStaticVtbl *vt = *(SfServerStaticVtbl **)svs;
+	if (!vt || !vt->GetBuildNum) return 0;
+
+	int bn = vt->GetBuildNum(svs);
+	return (bn > 0) ? bn : 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -591,6 +636,12 @@ C_DLLEXPORT int Meta_Attach(PLUG_LOADTIME now, META_FUNCTIONS *pFunctionTable,
 	ConPrint(SF_TAG " Version: %s Linux 'Counter-Strike 1.6'\n", Plugin_info.version);
 	ConPrint(SF_TAG " Success: Configuration executed%s.\n",
 			 found ? "" : " (no ini file, defaults in use)");
+	if (!g_BuildNum)
+		g_BuildNum = DetectRehldsBuild();
+	if (!(g_BuildNum > 0) && SF_REHLDS_BUILD > 0)
+		g_BuildNum = SF_REHLDS_BUILD;
+	if (g_BuildNum > 0)
+		ConPrint(SF_TAG " Success: Build ReHLDS version defined Linux '%d'\n", g_BuildNum);
 	ConPrint(SF_TAG " Author: t.me/Neo_Norm\n");
 	return TRUE;
 }

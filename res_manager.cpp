@@ -16,6 +16,7 @@
 #include <sys/ioctl.h>
 #include <sys/resource.h>
 #include <sys/prctl.h>
+#include <dlfcn.h>
 
 #ifndef PR_SET_TIMERSLACK
 #define PR_SET_TIMERSLACK 29
@@ -172,6 +173,50 @@ static void ConPrint(const char *fmt, ...) {
 	vsnprintf(buf, sizeof(buf), fmt, ap);
 	va_end(ap);
 	g_engfuncs.pfnServerPrint(buf);
+}
+
+/* ------------------------------------------------------------------ */
+/* ReHLDS build number for the banner                                  */
+/*                                                                     */
+/* 1) runtime getter: asks the loaded engine for                       */
+/*    IRehldsServerStatic::GetBuildNum (works on any ReHLDS build,     */
+/*    no compile flags needed);                                        */
+/* 2) fallback to -DRM_REHLDS_BUILD=4419 at compile time.              */
+/* Classic (non-ReHLDS) engines keep the line hidden, like before.     */
+/* ------------------------------------------------------------------ */
+static int g_BuildNum = 0;
+
+#ifndef RM_REHLDS_BUILD
+#define RM_REHLDS_BUILD 0
+#endif
+
+typedef void *(*RmCreateIface)(const char *, int *);
+
+struct RmServerStaticVtbl {
+	void *pads[8];                    /* skip first 8 vtable slots       */
+	int (*GetBuildNum)(void *self);   /* slot 9 in IRehldsServerStatic   */
+};
+
+static int DetectRehldsBuild() {
+	void *h = NULL;
+	const char *names[] = { "engine_i486.so", "./engine_i486.so" };
+	for (size_t i = 0; i < sizeof(names) / sizeof(names[0]) && !h; i++)
+		h = dlopen(names[i], RTLD_NOW | RTLD_NOLOAD);
+	if (!h) return 0;
+
+	RmCreateIface fn = (RmCreateIface)dlsym(h, "CreateInterface");
+	dlclose(h); /* engine stays loaded; this only drops our extra reference */
+	if (!fn) return 0;
+
+	int ok = 0;
+	void *svs = fn("VRehldsServerStatic001", &ok);
+	if (!svs || !ok) return 0;
+
+	RmServerStaticVtbl *vt = *(RmServerStaticVtbl **)svs;
+	if (!vt || !vt->GetBuildNum) return 0;
+
+	int bn = vt->GetBuildNum(svs);
+	return (bn > 0) ? bn : 0;
 }
 
 static int ActiveTic() {
@@ -703,7 +748,7 @@ static void OnConfigReloaded(double now) {
 	SyncTicrate(now, true);
 
 	ConPrint(RM_TAG " config reloaded: idle=%d, active=%d, target_fps=%.0f\n",
-			 IdleTic(), ActiveTic(), g_Cfg.target_fps);
+                  IdleTic(), ActiveTic(), g_Cfg.target_fps);
 }
 
 static void CheckConfigReload(double now, double interval) {
@@ -747,7 +792,7 @@ static void Cmd_Status(void) {
 	ConPrint(RM_TAG " status: %s | players=%d fps=%.1f cpu=%.1f%% ram=%ldMB tic=%d (idle=%d active=%d)%s\n",
 			 active ? "ACTIVE" : "IDLE", g_State.player_count, g_State.current_fps,
 			 g_State.cpu_usage, g_State.ram_usage_mb, g_State.applied_ticrate,
-			 IdleTic(), ActiveTic(), g_State.rt_on ? " [realtime]" : "");
+                  IdleTic(), ActiveTic(), g_State.rt_on ? " [realtime]" : "");
 	ConPrint(RM_TAG " config: %s | trim=%d maxmem=%ldMB pin=%d cores=%d prio=%d slack=%dns\n",
 			 g_CfgPath[0] ? g_CfgPath : "(defaults)", g_Cfg.trim_memory,
 			 g_Cfg.max_memory_mb, g_Cfg.pin_main_thread, g_Cfg.target_cores,
@@ -1049,9 +1094,18 @@ static void OnClientPutInServer(edict_t *pEntity) {
 		atexit_done = 1;
 		}
 
-		ConPrint(RM_TAG " v3.1 loaded (%s): idle=%d, active=%d, target_fps=%.0f, realtime=%d\n",
-		 found ? g_CfgPath : "no ini, defaults", IdleTic(), ActiveTic(),
-		 g_Cfg.target_fps, g_Cfg.realtime);
+		ConPrint(RM_TAG " Version: %s Linux 'Counter-Strike 1.6'\n", Plugin_info.version);
+                ConPrint(RM_TAG " Success: Configuration executed%s.\n",
+                  found ? "" : " (no ini file, defaults in use)");
+                if (!g_BuildNum)
+                        g_BuildNum = DetectRehldsBuild();
+                if (!(g_BuildNum > 0) && RM_REHLDS_BUILD > 0)
+                        g_BuildNum = RM_REHLDS_BUILD;
+                if (g_BuildNum > 0)
+                        ConPrint(RM_TAG " Success: Build ReHLDS version defined Linux '%d'\n", g_BuildNum);
+                ConPrint(RM_TAG " Detail: idle=%d active=%d target_fps=%.0f realtime=%d\n",
+                  IdleTic(), ActiveTic(), g_Cfg.target_fps, g_Cfg.realtime);
+                ConPrint(RM_TAG " Author: t.me/Neo_Norm\n");
 		return TRUE;
 			}
 
