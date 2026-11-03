@@ -13,8 +13,24 @@
 #define NT_HAVE_REHLDS 0
 #endif
 
+/* The guard watches what each player ACTUALLY uses (rate / cl_updaterate /
+ * cl_cmdrate / ex_interp) so manual changes can be reverted within seconds.
+ * Two ways to read those values:
+ *   - packet-level: ReHLDS exposes a ClientParse hookchain (only in newer
+ *     dev builds; the released 3.15 SDK does NOT have it).
+ *   - per-player cvar values: ReGameDLL_CS publishes client_* convars as
+ *     replicated server-side cvars that hold each player's current value.
+ * If neither is available the guard degrades automatically to the periodic
+ * re-push (recheck_minutes) and round-start re-check. */
+#ifndef NT_USE_CLIENTPARSE
+#define NT_USE_CLIENTPARSE 0
+#endif
+#ifndef NT_USE_CVARGUARD
+#define NT_USE_CVARGUARD 1
+#endif
+
 #if NT_HAVE_REHLDS
-#include <rehlds_api.h>   /* needs SDK headers with SV_EmitPings + ClientParse hooks */
+#include <rehlds_api.h>   /* SDK: rehlds_sdk/rehlds/public/rehlds */
 #endif
 
 /*
@@ -26,16 +42,21 @@
  * cvars are never touched here.
  *
  * v1.7 changes:
- *   - Settings Guard (needs -DNT_HAVE_REHLDS=1): watches the four key cvars
- *     in each player's incoming ClientData via the ClientParse hookchain;
- *     manual changes are pushed back within ~2-3 seconds. Without the flag
- *     the guard degrades to a per-minute full re-push.
+ *   - Settings Guard with 3 automatic levels:
+ *       level 2 (packet): needs a ReHLDS build whose SDK exposes the
+ *                 ClientParse hookchain (-DNT_HAVE_REHLDS=1 plus
+ *                 -DNT_USE_CLIENTPARSE=1). Reverts manual changes in ~2-3s.
+ *       level 1 (cvar poll): reads each player's replicated client_* cvars
+ *                 (ReGameDLL_CS) every guard_interval seconds and reverts
+ *                 manual changes. Works on plain ReHLDS 3.15, no extra flag.
+ *       level 0 (fallback): periodic full re-push every recheck_minutes.
  *   - Faster recovery: learn_seconds 20->15, improve_seconds 45->10,
  *     min_change_interval 20->15.
  *   - Round-start re-check: round restarts are detected through gpGlobals
  *     and the tier is re-evaluated and re-applied immediately.
  *   - Periodic re-push every recheck_minutes (default 1 minute).
- *   - Scoreboard ping smoothing still behind NT_HAVE_REHLDS.
+ *   - Scoreboard ping smoothing behind NT_HAVE_REHLDS (SV_EmitPings exists
+ *     in the released 3.15 SDK headers).
  */
 
 plugin_info_t Plugin_info = {
@@ -115,6 +136,7 @@ struct NtSettings {
 	/* v1.7: settings guard + periodic re-check */
 	int   guard;              /* push back manual changes of the 4 key cvars */
 	float guard_cooldown;     /* min seconds between guard pushes per player */
+	float guard_interval;     /* seconds between guard checks when polling cvars */
 	float recheck_minutes;    /* full re-evaluate/re-push interval (minutes) */
 
 	int   debug;
@@ -175,7 +197,9 @@ static double   g_LastPoll = 0.0;
 static double   g_LastDebug = 0.0;
 static int      g_LastRound = -1;          /* v1.7 round-start re-check */
 static int      g_RoundJustStarted = 0;
-static int      g_BuildNum = 0;              /* ReHLDS build number, 0 = unknown */
+static int      g_BuildNum = 0;            /* ReHLDS build number, 0 = unknown */
+static int      g_GuardMode = 0;           /* 0 none, 1 cvar-poll, 2 packet (ClientParse) */
+static double   g_LastGuardPoll = 0.0;
 
 /* ------------------------------------------------------------------ */
 /* Helpers                                                             */
@@ -290,6 +314,7 @@ static int try_load_config(const char *path) {
 		else if (strcmp(key, "ping_grace") == 0)             g_Cfg.ping_grace = (float)atof(val);
 		else if (strcmp(key, "guard") == 0)                   g_Cfg.guard = atoi(val);
 		else if (strcmp(key, "guard_cooldown") == 0)          g_Cfg.guard_cooldown = (float)atof(val);
+		else if (strcmp(key, "guard_interval") == 0)          g_Cfg.guard_interval = (float)atof(val);
 		else if (strcmp(key, "recheck_minutes") == 0)         g_Cfg.recheck_minutes = (float)atof(val);
 		else if (strcmp(key, "debug") == 0)                  g_Cfg.debug = atoi(val);
 		else if (strcmp(key, "quiet") == 0)                  g_Cfg.quiet = atoi(val);
@@ -355,6 +380,7 @@ static void SetDefaults() {
 
 	g_Cfg.guard = 1;
 	g_Cfg.guard_cooldown = 5.0f;
+	g_Cfg.guard_interval = 3.0f;
 	g_Cfg.recheck_minutes = 1.0f;
 
 	g_Cfg.debug = 0;
@@ -404,6 +430,7 @@ static void ClampConfig() {
 	g_Cfg.ping_grace = clampf(g_Cfg.ping_grace, 5.0f, 600.0f);
 
 	g_Cfg.guard_cooldown = clampf(g_Cfg.guard_cooldown, 2.0f, 60.0f);
+	g_Cfg.guard_interval = clampf(g_Cfg.guard_interval, 1.0f, 30.0f);
 	g_Cfg.recheck_minutes = clampf(g_Cfg.recheck_minutes, 0.5f, 60.0f);
 }
 
@@ -730,62 +757,135 @@ static void UpdateDisplayPing(Slot &s, int ping, double now) {
 /* v1.7 Settings Guard                                                 */
 /* The four cvars that actually shape latency feel and hit reg:        */
 /*   rate, cl_updaterate, cl_cmdrate, ex_interp                        */
-/* We know exactly what the player's CURRENT tier wants; if we can see */
-/* what the client is actually using (ReHLDS ClientData), a manual     */
-/* change is pushed back within seconds. Without ReHLDS the guard      */
-/* falls back to the periodic full re-push in PollClients.             */
+/* We know exactly what the player's CURRENT tier wants. Two ways to   */
+/* see what the client ACTUALLY uses:                                  */
+/*   level 2 (packet): ReHLDS ClientParse hookchain (only in newer dev */
+/*             builds; enable with -DNT_USE_CLIENTPARSE=1).            */
+/*   level 1 (cvar poll): ReGameDLL_CS replicates each player's values */
+/*             as server-side convars named client_* - read them every */
+/*             guard_interval seconds. Works on plain ReHLDS 3.15.     */
+/* If neither source exists the guard degrades to the periodic re-push.*/
 /* ------------------------------------------------------------------ */
 
 static int WantUpd(int tier)  { return g_Cfg.t_upd[clampi(tier, 0, NT_TIERS - 1)]; }
 static int WantCmd(int tier)  { return g_Cfg.t_cmd[clampi(tier, 0, NT_TIERS - 1)]; }
 static float WantInterp(int tier) {
-int t = clampi(tier, 0, NT_TIERS - 1);
-return g_Cfg.t_ratio[t] / (float)g_Cfg.t_upd[t];
+	int t = clampi(tier, 0, NT_TIERS - 1);
+	return g_Cfg.t_ratio[t] / (float)g_Cfg.t_upd[t];
 }
 
-#if NT_HAVE_REHLDS
+/* shared mismatch logic: given the 4 observed values of a player, push his
+ * tier profile back when at least one stays wrong across two checks */
+static void GuardEvaluate(int idx, int rate, int upd, int cmd, float interp, double now) {
+	if (!g_Cfg.guard || !g_Cfg.client_enforce || idx < 1 || idx > NT_MAX_CLIENTS) return;
+	Slot &s = g_Slot[idx];
+	if (!s.active) return;
+
+	int wupd = WantUpd(s.tier), wcmd = WantCmd(s.tier);
+	float winterp = WantInterp(s.tier);
+
+	int m0 = (rate != 0 && rate != g_Cfg.cl_rate) ? 1 : 0;
+	int m1 = (upd >= 0 && upd != wupd) ? 1 : 0;
+	int m2 = (cmd >= 0 && cmd != wcmd) ? 1 : 0;
+	int m3 = (interp > 0.0f && fabsf(interp - winterp) > 0.0009f) ? 1 : 0;
+
+	if (!m0 && !m1 && !m2 && !m3) {          /* everything matches again */
+		s.mism[0] = s.mism[1] = s.mism[2] = s.mism[3] = 0;
+		return;
+	}
+
+	/* require the mismatch to be seen twice before acting, so a single
+	 * stale packet or a mid-update value never triggers a push */
+	int any_twice = 0;
+	s.mism[0] = m0 ? s.mism[0] + 1 : 0;
+	s.mism[1] = m1 ? s.mism[1] + 1 : 0;
+	s.mism[2] = m2 ? s.mism[2] + 1 : 0;
+	s.mism[3] = m3 ? s.mism[3] + 1 : 0;
+	for (int k = 0; k < 4; k++) if (s.mism[k] >= 2) any_twice = 1;
+
+	if (any_twice && now - s.last_guard_push >= (double)g_Cfg.guard_cooldown) {
+		s.last_guard_push = now;
+		s.mism[0] = s.mism[1] = s.mism[2] = s.mism[3] = 0;
+		edict_t *e = INDEXENT(idx);
+		if (e && !e->free) {
+			PushClientSettings(idx, e, false);
+			if (g_Cfg.debug)
+				ConPrint(NT_TAG " #%d guard: manual settings reverted (T%d)\n", idx, s.tier);
+		}
+	}
+}
+
+#if NT_HAVE_REHLDS && NT_USE_CLIENTPARSE
 /* called from the ClientParse hook with the fresh incoming clientdata */
 static void GuardCheckClient(int idx, const ClientInfo &ci) {
-if (!g_Cfg.guard || !g_Cfg.client_enforce || idx < 1 || idx > NT_MAX_CLIENTS) return;
-Slot &s = g_Slot[idx];
-if (!s.active) return;
+	GuardEvaluate(idx, ci.m_rate, (int)ci.m_updaterate, (int)ci.m_cmdrate,
+				  ci.m_interp, NowSec());
+}
+#endif
 
-double now = NowSec();
-int upd = WantUpd(s.tier), cmd = WantCmd(s.tier);
-float interp = WantInterp(s.tier);
+#if NT_USE_CVARGUARD
+/* ReGameDLL_CS publishes these replicated per-player convars; their names
+ * are "client_<name><entindex>" (e.g. client_cmdrate1). A pointer is fetched
+ * once per name and cached forever: engine convars are never freed while the
+ * game DLL that created them stays loaded. */
+static const char *kCvPlayerNames[4][8] = {
+	{ "client_cmdrate", "cl_cmdrate", NULL },
+	{ "client_updaterate", "cl_updaterate", NULL },
+	{ "client_truerate", "client_rate", "rate", NULL },
+	{ "client_interp", "ex_interp", NULL }
+};
+#define CV_P_NONE (-1)
+#define CV_P_UNK  (-2)
+static cvar_t *g_CvPlayer[NT_MAX_CLIENTS + 1][4];
+static int     g_CvPState[NT_MAX_CLIENTS + 1][4];
+static int     g_CvGuardAvail = 0;
 
-/* ReHLDS ClientInfo members carry the m_ prefix */
-int m0 = (ci.m_rate != g_Cfg.cl_rate) ? 1 : 0;
-int m1 = ((int)ci.m_updaterate != upd) ? 1 : 0;
-int m2 = ((int)ci.m_cmdrate != cmd) ? 1 : 0;
-int m3 = (fabsf(ci.m_interp - interp) > 0.0009f) ? 1 : 0;
-
-if (!m0 && !m1 && !m2 && !m3) {           /* everything matches again */
-s.mism[0] = s.mism[1] = s.mism[2] = s.mism[3] = 0;
-return;
+static cvar_t *FindPlayerCvar(int idx, int which) {
+	char nm[64];
+	for (int n = 0; kCvPlayerNames[which][n]; n++) {
+		snprintf(nm, sizeof(nm), "%s%d", kCvPlayerNames[which][n], idx);
+		cvar_t *c = g_engfuncs.pfnCVarGetPointer(nm);
+		if (!c) snprintf(nm, sizeof(nm), "%s_%d", kCvPlayerNames[which][n], idx);
+		c = g_engfuncs.pfnCVarGetPointer(nm);
+		if (c) return c;
+	}
+	return NULL;
 }
 
-/* require the mismatch to be seen twice (~2 packets) before acting,
- * so a single stale/legacy packet never triggers a push */
-int any_twice = 0;
-s.mism[0] = m0 ? s.mism[0] + 1 : 0;
-s.mism[1] = m1 ? s.mism[1] + 1 : 0;
-s.mism[2] = m2 ? s.mism[2] + 1 : 0;
-s.mism[3] = m3 ? s.mism[3] + 1 : 0;
-for (int k = 0; k < 4; k++) if (s.mism[k] >= 2) any_twice = 1;
+/* returns 1 when at least one replicated player cvar was found */
+static int GuardPollCvars(double now) {
+	int maxc = gpGlobals ? gpGlobals->maxClients : 0;
+	if (maxc > NT_MAX_CLIENTS) maxc = NT_MAX_CLIENTS;
+	int any = 0;
 
-if (any_twice && now - s.last_guard_push >= (double)g_Cfg.guard_cooldown) {
-s.last_guard_push = now;
-s.mism[0] = s.mism[1] = s.mism[2] = s.mism[3] = 0;
-edict_t *e = INDEXENT(idx);
-if (e && !e->free) {
-PushClientSettings(idx, e, false);
-if (g_Cfg.debug)
-ConPrint(NT_TAG " #%d guard: manual settings reverted (T%d)\n", idx, s.tier);
+	for (int i = 1; i <= maxc; i++) {
+		Slot &s = g_Slot[i];
+		if (!s.active) continue;
+
+		int rate = 0, upd = -1, cmd = -1;
+		float interp = 0.0f;
+		for (int k = 0; k < 4; k++) {
+			if (g_CvPState[i][k] == CV_P_NONE) continue;
+			if (g_CvPState[i][k] == CV_P_UNK) {
+				cvar_t *c = FindPlayerCvar(i, k);
+				if (c) { g_CvPlayer[i][k] = c; g_CvPState[i][k] = 0; }
+				else { g_CvPState[i][k] = CV_P_NONE; continue; }
+			}
+			cvar_t *c = g_CvPlayer[i][k];
+			if (!c) continue;
+			any = 1;
+			switch (k) {
+				case 0: cmd = (int)c->value; break;
+				case 1: upd = (int)c->value; break;
+				case 2: rate = (int)c->value; break;
+				default: interp = c->value; break;
+			}
+		}
+		GuardEvaluate(i, rate, upd, cmd, interp, now);
+	}
+	return any;
 }
-}
-}
-#endif /* NT_HAVE_REHLDS */
+#endif /* NT_USE_CVARGUARD */
 
 static void PollClients(double now) {
 	int maxc = gpGlobals ? gpGlobals->maxClients : 0;
@@ -1027,9 +1127,12 @@ static void NT_SV_EmitPings(IRehldsHook_SV_EmitPings *chain, IGameClient *cl, si
 	WritePingsMessage(msg, true);
 }
 
-/* v1.7 guard: peek at every incoming client packet. When the player sends
- * his ClientData (once per update), compare what he actually uses against
- * what his tier wants; a manual change is reverted within ~2-3 seconds. */
+#if NT_HAVE_REHLDS && NT_USE_CLIENTPARSE
+/* v1.7 guard level 2: peek at every incoming client packet. When the player
+ * sends his ClientData (once per update), compare what he actually uses
+ * against what his tier wants; a manual change is reverted within ~2-3s.
+ * NOTE: released ReHLDS 3.15 does NOT expose this hookchain - only newer
+ * dev builds do. Keep the flag off unless your SDK declares ClientParse(). */
 static void NT_ClientParse(IRehldsHook_ClientParse *chain, IGameClient *cl,
                            uint8 *data, int size, netadr_t from, float *dt) {
 	if (g_On && g_Cfg.guard && g_Cfg.client_enforce && g_RehldsSvs && cl) {
@@ -1044,6 +1147,7 @@ static void NT_ClientParse(IRehldsHook_ClientParse *chain, IGameClient *cl,
 	}
 	chain->callNext(cl, data, size, from, dt);
 }
+#endif /* NT_HAVE_REHLDS && NT_USE_CLIENTPARSE */
 
 #endif /* NT_HAVE_REHLDS */
 
@@ -1099,22 +1203,49 @@ static void OnStartFrame() {
 		ApplyCvars();
 	}
 
-	/* v1.7: detect a fresh round (roundCount increases at round restart). */
+	/* v1.7: detect a fresh round (roundCount increases at round restart).
+	 * The HLSDK 1.0 globalvars_t has no roundCount, so it is read through a
+	 * layout-compatible view of the GoldSource/ReHLDS engine struct. */
 	g_RoundJustStarted = 0;
-#if defined(GOLDSOURCE_VERSION) || NT_HAVE_REHLDS
-	/* roundCount exists on GS/ReHLDS engines only */
 	if (gpGlobals) {
+#if defined(GOLDSOURCE_VERSION) || NT_HAVE_REHLDS
 		int rc = (int)gpGlobals->roundCount;
+#else
+		struct NtGSVars {
+			float time; int frameTime; int maxClients; int maxEntities;
+			float deadtime; Vector physical_ammo, game_title, geographica;
+			int maxModels, maxSounds, maxDecals, modelIndex[12];
+			char lightStyle[64]; int count; int flags; float conainter;
+			float time_of_day; float light_adjustment; float skyVec[3][2];
+			float skyAlpha; float skyColor[3]; int skyRendMode;
+			float fadeVol; float fadeTrans; float fadePoints;
+			int fadeVisPVS; float teamScore[4]; float roundTime;
+			int roundCount;   /* added by the GoldSource/CS engine */
+		};
+		int rc = ((NtGSVars *)gpGlobals)->roundCount;
+#endif
 		if (g_LastRound < 0) g_LastRound = rc;
 		else if (rc != g_LastRound) { g_LastRound = rc; g_RoundJustStarted = 1; }
 	}
-#endif
 
 	if (now - g_LastPoll >= 1.0 || g_RoundJustStarted) {
 		g_LastPoll = now;
 		PollClients(now);
 		if (g_Cfg.debug) DebugSummary(now);
 	}
+
+#if NT_USE_CVARGUARD
+	/* guard level 1: check what every player actually uses, every few seconds */
+	if (g_GuardMode == 1 && g_Cfg.guard && g_Cfg.client_enforce &&
+		now - g_LastGuardPoll >= (double)g_Cfg.guard_interval) {
+		g_LastGuardPoll = now;
+		if (!g_CvGuardAvail) {
+			if (GuardPollCvars(now)) g_CvGuardAvail = 1;
+		} else {
+			GuardPollCvars(now);
+		}
+	}
+#endif
 }
 
 static void OnClientPutInServer(edict_t *pEntity) {
