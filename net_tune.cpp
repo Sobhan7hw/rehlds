@@ -9,32 +9,39 @@
 #include <dlfcn.h>
 #include <sys/stat.h>
 
-/*
- * NetTune 1.5 - Connection quality tuner for CS 1.6 / ReHLDS / Metamod-R
- * Author: FaTaL-[Hit] - https://t.me/Neo_Norm
- *
- * Changelog vs 1.4 (compile errors on the ReHLDS 3.15 SDK you are using):
- *   Your rehlds_api.h does NOT declare IRehldsHook_SV_EmitPings and
- *   IRehldsHookchains has no SV_EmitPings() member, so every reference to
- *   them failed to compile. v1.5 keeps ALL logic intact but puts the whole
- *   scoreboard-ping-smoothing path (hook + message writer + API handles)
- *   behind the NT_HAVE_REHLDS feature flag:
- *     - default (no flag): section excluded -> compiles cleanly on your
- *       SDK; smoothing reports "not compiled" in the console at load.
- *       Every other feature (auto-tune tiers, cvar enforcement, client
- *       push, tier cache, kick policy, hot reload) works exactly as before.
- *     - -DNT_HAVE_REHLDS=1: full v1.4 behaviour, requires SDK headers that
- *       expose the SV_EmitPings hookchain (newer ReHLDS dev builds).
- */
-
 #ifndef NT_HAVE_REHLDS
 #define NT_HAVE_REHLDS 0
 #endif
 
+#if NT_HAVE_REHLDS
+#include <rehlds_api.h>   /* needs SDK headers with SV_EmitPings + ClientParse hooks */
+#endif
+
+/*
+ * NetTune 1.7 - Smart connection tuner for CS 1.6 / ReHLDS / Metamod-R
+ * Author: FaTaL-[Hit] - https://t.me/Neo_Norm
+ *
+ * Focus: cl_cmdrate, cl_updaterate, rate, ex_interp (plus cl_lc/cl_lw once
+ * on join). sv_unlag* is owned by ShotFix; mp_timelimit and other gameplay
+ * cvars are never touched here.
+ *
+ * v1.7 changes:
+ *   - Settings Guard (needs -DNT_HAVE_REHLDS=1): watches the four key cvars
+ *     in each player's incoming ClientData via the ClientParse hookchain;
+ *     manual changes are pushed back within ~2-3 seconds. Without the flag
+ *     the guard degrades to a per-minute full re-push.
+ *   - Faster recovery: learn_seconds 20->15, improve_seconds 45->10,
+ *     min_change_interval 20->15.
+ *   - Round-start re-check: round restarts are detected through gpGlobals
+ *     and the tier is re-evaluated and re-applied immediately.
+ *   - Periodic re-push every recheck_minutes (default 1 minute).
+ *   - Scoreboard ping smoothing still behind NT_HAVE_REHLDS.
+ */
+
 plugin_info_t Plugin_info = {
 	META_INTERFACE_VERSION,
 	"NetTune",
-	"1.5",
+	"1.7",
 	__DATE__,
 	"FaTaL-[Hit]",
 	"https://t.me/Neo_Norm",
@@ -105,6 +112,11 @@ struct NtSettings {
 	float max_ping_seconds;
 	float ping_grace;
 
+	/* v1.7: settings guard + periodic re-check */
+	int   guard;              /* push back manual changes of the 4 key cvars */
+	float guard_cooldown;     /* min seconds between guard pushes per player */
+	float recheck_minutes;    /* full re-evaluate/re-push interval (minutes) */
+
 	int   debug;
 } g_Cfg;
 
@@ -140,6 +152,11 @@ struct Slot {
 	float  disp_ping;
 	int    disp_init;
 	double disp_time;
+
+	/* v1.7 guard: mismatch counters for rate/updaterate/cmdrate/interp */
+	int    mism[4];
+	double last_guard_push;
+	double last_full_push;
 };
 
 struct CacheEnt {
@@ -155,6 +172,8 @@ static double   g_LastCfgCheck = 0.0;
 static double   g_LastEnforce = 0.0;
 static double   g_LastPoll = 0.0;
 static double   g_LastDebug = 0.0;
+static int      g_LastRound = -1;          /* v1.7 round-start re-check */
+static int      g_RoundJustStarted = 0;
 
 /* ------------------------------------------------------------------ */
 /* Helpers                                                             */
@@ -267,6 +286,9 @@ static int try_load_config(const char *path) {
 		else if (strcmp(key, "max_ping") == 0)               g_Cfg.max_ping = atoi(val);
 		else if (strcmp(key, "max_ping_seconds") == 0)       g_Cfg.max_ping_seconds = (float)atof(val);
 		else if (strcmp(key, "ping_grace") == 0)             g_Cfg.ping_grace = (float)atof(val);
+		else if (strcmp(key, "guard") == 0)                   g_Cfg.guard = atoi(val);
+		else if (strcmp(key, "guard_cooldown") == 0)          g_Cfg.guard_cooldown = (float)atof(val);
+		else if (strcmp(key, "recheck_minutes") == 0)         g_Cfg.recheck_minutes = (float)atof(val);
 		else if (strcmp(key, "debug") == 0)                  g_Cfg.debug = atoi(val);
 		else ParseTierKey(key, val);
 	}
@@ -294,10 +316,10 @@ static void SetDefaults() {
 
 	g_Cfg.auto_tune = 1;
 	g_Cfg.start_tier = 0;
-	g_Cfg.learn_seconds = 20.0f;
+	g_Cfg.learn_seconds = 15.0f;
 	g_Cfg.worsen_seconds = 6.0f;
-	g_Cfg.improve_seconds = 45.0f;
-	g_Cfg.min_change_interval = 20.0f;
+	g_Cfg.improve_seconds = 10.0f;
+	g_Cfg.min_change_interval = 15.0f;
 	g_Cfg.apply_defer_max = 15.0f;
 	g_Cfg.emergency_loss = 15.0f;
 	g_Cfg.remember_seconds = 1800.0f;
@@ -327,6 +349,10 @@ static void SetDefaults() {
 	g_Cfg.max_ping = 0;
 	g_Cfg.max_ping_seconds = 20.0f;
 	g_Cfg.ping_grace = 30.0f;
+
+	g_Cfg.guard = 1;
+	g_Cfg.guard_cooldown = 5.0f;
+	g_Cfg.recheck_minutes = 1.0f;
 
 	g_Cfg.debug = 0;
 }
@@ -372,6 +398,9 @@ static void ClampConfig() {
 	if (g_Cfg.max_ping < 0) g_Cfg.max_ping = 0;
 	g_Cfg.max_ping_seconds = clampf(g_Cfg.max_ping_seconds, 5.0f, 600.0f);
 	g_Cfg.ping_grace = clampf(g_Cfg.ping_grace, 5.0f, 600.0f);
+
+	g_Cfg.guard_cooldown = clampf(g_Cfg.guard_cooldown, 2.0f, 60.0f);
+	g_Cfg.recheck_minutes = clampf(g_Cfg.recheck_minutes, 0.5f, 60.0f);
 }
 
 /* returns true if a file was read. A failed reload restores the full old state. */
@@ -693,6 +722,67 @@ static void UpdateDisplayPing(Slot &s, int ping, double now) {
 	if (s.disp_ping < 0.0f) s.disp_ping = 0.0f;
 }
 
+/* ------------------------------------------------------------------ */
+/* v1.7 Settings Guard                                                 */
+/* The four cvars that actually shape latency feel and hit reg:        */
+/*   rate, cl_updaterate, cl_cmdrate, ex_interp                        */
+/* We know exactly what the player's CURRENT tier wants; if we can see */
+/* what the client is actually using (ReHLDS ClientData), a manual     */
+/* change is pushed back within seconds. Without ReHLDS the guard      */
+/* falls back to the periodic full re-push in PollClients.             */
+/* ------------------------------------------------------------------ */
+
+static int WantUpd(int tier)  { return g_Cfg.t_upd[clampi(tier, 0, NT_TIERS - 1)]; }
+static int WantCmd(int tier)  { return g_Cfg.t_cmd[clampi(tier, 0, NT_TIERS - 1)]; }
+static float WantInterp(int tier) {
+int t = clampi(tier, 0, NT_TIERS - 1);
+return g_Cfg.t_ratio[t] / (float)g_Cfg.t_upd[t];
+}
+
+#if NT_HAVE_REHLDS
+/* called from the ClientParse hook with the fresh incoming clientdata */
+static void GuardCheckClient(int idx, const ClientInfo &ci) {
+if (!g_Cfg.guard || !g_Cfg.client_enforce || idx < 1 || idx > NT_MAX_CLIENTS) return;
+Slot &s = g_Slot[idx];
+if (!s.active) return;
+
+double now = NowSec();
+int upd = WantUpd(s.tier), cmd = WantCmd(s.tier);
+float interp = WantInterp(s.tier);
+
+/* ReHLDS ClientInfo members carry the m_ prefix */
+int m0 = (ci.m_rate != g_Cfg.cl_rate) ? 1 : 0;
+int m1 = ((int)ci.m_updaterate != upd) ? 1 : 0;
+int m2 = ((int)ci.m_cmdrate != cmd) ? 1 : 0;
+int m3 = (fabsf(ci.m_interp - interp) > 0.0009f) ? 1 : 0;
+
+if (!m0 && !m1 && !m2 && !m3) {           /* everything matches again */
+s.mism[0] = s.mism[1] = s.mism[2] = s.mism[3] = 0;
+return;
+}
+
+/* require the mismatch to be seen twice (~2 packets) before acting,
+ * so a single stale/legacy packet never triggers a push */
+int any_twice = 0;
+s.mism[0] = m0 ? s.mism[0] + 1 : 0;
+s.mism[1] = m1 ? s.mism[1] + 1 : 0;
+s.mism[2] = m2 ? s.mism[2] + 1 : 0;
+s.mism[3] = m3 ? s.mism[3] + 1 : 0;
+for (int k = 0; k < 4; k++) if (s.mism[k] >= 2) any_twice = 1;
+
+if (any_twice && now - s.last_guard_push >= (double)g_Cfg.guard_cooldown) {
+s.last_guard_push = now;
+s.mism[0] = s.mism[1] = s.mism[2] = s.mism[3] = 0;
+edict_t *e = INDEXENT(idx);
+if (e && !e->free) {
+PushClientSettings(idx, e, false);
+if (g_Cfg.debug)
+ConPrint(NT_TAG " #%d guard: manual settings reverted (T%d)\n", idx, s.tier);
+}
+}
+}
+#endif /* NT_HAVE_REHLDS */
+
 static void PollClients(double now) {
 	int maxc = gpGlobals ? gpGlobals->maxClients : 0;
 	if (maxc > NT_MAX_CLIENTS) maxc = NT_MAX_CLIENTS;
@@ -725,27 +815,48 @@ static void PollClients(double now) {
 			ComputeMetrics(s);
 		}
 
-		if (g_Cfg.client_enforce) {
-			EvaluateTier(s, now);
+EvaluateTier(s, now);
 
-			/* apply a waiting change when the player is dead/spectating,
-			 *		   or when it has waited long enough (urgent changes do not wait) */
-			if (s.pending_tier >= 0) {
-				bool safe = (e->v.deadflag != DEAD_NO);
-				if (safe || now - s.pending_since >= (double)g_Cfg.apply_defer_max) {
-					int old = s.tier;
-					s.tier = s.pending_tier;
-					s.pending_tier = -1;
-					s.last_change = now;
-					PushClientSettings(i, e, false);
-					CacheStore(s, s.tier, now);
-					if (g_Cfg.debug)
-						ConPrint(NT_TAG " #%d tier %d -> %d (loss=%.1f%% jitter=%.1fms spike=%.0fms ping=%.0f)\n",
-								 i, old, s.tier, s.avg_loss, s.jitter, s.spike, s.avg_ping);
-				}
-			}
-		}
+/* apply a waiting change when the player is dead/spectating,
+ * or when it has waited long enough (urgent changes do not wait) */
+if (s.pending_tier >= 0) {
+bool safe = (e->v.deadflag != DEAD_NO);
+if (safe || now - s.pending_since >= (double)g_Cfg.apply_defer_max) {
+int old = s.tier;
+s.tier = s.pending_tier;
+s.pending_tier = -1;
+s.last_change = now;
+if (g_Cfg.client_enforce) PushClientSettings(i, e, false);
+CacheStore(s, s.tier, now);
+if (g_Cfg.debug)
+ConPrint(NT_TAG " #%d tier %d -> %d (loss=%.1f%% jitter=%.1fms spike=%.0fms ping=%.0f)\n",
+ i, old, s.tier, s.avg_loss, s.jitter, s.spike, s.avg_ping);
+}
+}
 
+/* v1.7 periodic re-check: every recheck_minutes (default 1 min)
+ * re-evaluate the tier and re-push the current profile, so manual
+ * changes or silent drift are corrected even without the guard. */
+if (g_Cfg.client_enforce &&
+    now - s.last_full_push >= (double)(g_Cfg.recheck_minutes * 60.0f)) {
+s.last_full_push = now;
+EvaluateTier(s, now);
+PushClientSettings(i, e, false);
+}
+
+/* v1.7 round-start re-check: act immediately at the beginning of
+ * each round instead of waiting for the poll timers. */
+if (g_RoundJustStarted && g_Cfg.client_enforce) {
+s.worse_since = 0.0;
+s.better_since = 0.0;
+EvaluateTier(s, now);
+if (s.pending_tier >= 0) {
+/* urgent: do not defer across rounds */
+s.pending_since = now - (double)g_Cfg.apply_defer_max;
+} else if (now - s.last_change >= 5.0) {
+PushClientSettings(i, e, false);   /* keep values pinned to the tier */
+}
+}
 		/* ---- optional kick for permanently high ping ---- */
 		if (g_Cfg.max_ping > 0 && now - s.join_time >= (double)g_Cfg.ping_grace) {
 			if (ping > g_Cfg.max_ping) {
@@ -800,7 +911,6 @@ static void DebugSummary(double now) {
 /* ------------------------------------------------------------------ */
 
 #if NT_HAVE_REHLDS
-#include <rehlds_api.h>
 
 /* ReHLDS API handles (declared here: the types exist only when the header is included) */
 static IRehldsApi              *g_RehldsApi = NULL;
@@ -808,6 +918,7 @@ static const RehldsFuncs_t     *g_RehldsFuncs = NULL;
 static IRehldsHookchains       *g_RehldsHookchains = NULL;
 static IRehldsServerStatic     *g_RehldsSvs = NULL;
 static int                      g_HookRegistered = 0;
+static int                      g_GuardRegistered = 0;
 static int                      g_PingFmt = 0;   /* 0 unverified, 1 verified, -1 failed */
 
 typedef void *(*NtCreateIface)(const char *, int *);
@@ -906,6 +1017,24 @@ static void NT_SV_EmitPings(IRehldsHook_SV_EmitPings *chain, IGameClient *cl, si
 	WritePingsMessage(msg, true);
 }
 
+/* v1.7 guard: peek at every incoming client packet. When the player sends
+ * his ClientData (once per update), compare what he actually uses against
+ * what his tier wants; a manual change is reverted within ~2-3 seconds. */
+static void NT_ClientParse(IRehldsHook_ClientParse *chain, IGameClient *cl,
+                           uint8 *data, int size, netadr_t from, float *dt) {
+	if (g_On && g_Cfg.guard && g_Cfg.client_enforce && g_RehldsSvs && cl) {
+		int nclients = g_RehldsSvs->GetMaxClients();
+		if (nclients > NT_MAX_CLIENTS) nclients = NT_MAX_CLIENTS;
+		for (int i = 0; i < nclients; i++) {
+			if (g_RehldsSvs->GetClient(i) == cl) {
+				GuardCheckClient(i + 1, cl->m_pClientInfo);
+				break;
+			}
+		}
+	}
+	chain->callNext(cl, data, size, from, dt);
+}
+
 #endif /* NT_HAVE_REHLDS */
 
 /* ------------------------------------------------------------------ */
@@ -960,7 +1089,18 @@ static void OnStartFrame() {
 		ApplyCvars();
 	}
 
-	if (now - g_LastPoll >= 1.0) {
+	/* v1.7: detect a fresh round (roundCount increases at round restart). */
+	g_RoundJustStarted = 0;
+#if defined(GOLDSOURCE_VERSION) || NT_HAVE_REHLDS
+	/* roundCount exists on GS/ReHLDS engines only */
+	if (gpGlobals) {
+		int rc = (int)gpGlobals->roundCount;
+		if (g_LastRound < 0) g_LastRound = rc;
+		else if (rc != g_LastRound) { g_LastRound = rc; g_RoundJustStarted = 1; }
+	}
+#endif
+
+	if (now - g_LastPoll >= 1.0 || g_RoundJustStarted) {
 		g_LastPoll = now;
 		PollClients(now);
 		if (g_Cfg.debug) DebugSummary(now);
@@ -1085,6 +1225,7 @@ C_DLLEXPORT int Meta_Attach(PLUG_LOADTIME now, META_FUNCTIONS *pFunctionTable,
 
 	/* ping smoothing needs the ReHLDS API; everything else works without it */
 	const char *ping_state = "off";
+	const char *guard_state = "off";
 #if NT_HAVE_REHLDS
 	if (g_Cfg.smooth_ping) {
 		if (RehldsInit()) {
@@ -1095,6 +1236,18 @@ C_DLLEXPORT int Meta_Attach(PLUG_LOADTIME now, META_FUNCTIONS *pFunctionTable,
 			ping_state = "unavailable (ReHLDS API not found or too old)";
 		}
 	}
+	/* v1.7 guard: watch incoming client packets and revert manual changes */
+	if (g_Cfg.guard && g_Cfg.client_enforce) {
+		if (RehldsInit()) {
+			g_RehldsHookchains->ClientParse()->registerHook(NT_ClientParse);
+			g_GuardRegistered = 1;
+			guard_state = "on (packet-level check, ~2-3s reaction)";
+		} else {
+			guard_state = "degraded (per-minute re-push only)";
+		}
+	} else {
+		guard_state = "off";
+	}
 #else
 	if (g_Cfg.smooth_ping)
 		ping_state = "not compiled (SDK lacks SV_EmitPings; rebuild with -DNT_HAVE_REHLDS=1 + matching headers)";
@@ -1102,9 +1255,10 @@ C_DLLEXPORT int Meta_Attach(PLUG_LOADTIME now, META_FUNCTIONS *pFunctionTable,
 
 	g_On = 1;
 
-	ConPrint(NT_TAG " v1.5 loaded (%s): auto_tune=%d start_tier=%d rate=%d max_ping=%d ping_smoothing=%s\n",
+	ConPrint(NT_TAG " v1.7 loaded (%s): auto_tune=%d start_tier=%d rate=%d max_ping=%d ping_smoothing=%s guard=%s\n",
 			 found ? g_CfgPath : "no ini, defaults",
-		  g_Cfg.auto_tune, g_Cfg.start_tier, g_Cfg.cl_rate, g_Cfg.max_ping, ping_state);
+		  g_Cfg.auto_tune, g_Cfg.start_tier, g_Cfg.cl_rate, g_Cfg.max_ping, ping_state, guard_state);
+
 	return TRUE;
 }
 
@@ -1114,6 +1268,10 @@ C_DLLEXPORT int Meta_Detach(PLUG_LOADTIME now, PL_UNLOAD_REASON reason) {
 	if (g_HookRegistered && g_RehldsHookchains) {
 		g_RehldsHookchains->SV_EmitPings()->unregisterHook(NT_SV_EmitPings);
 		g_HookRegistered = 0;
+	}
+	if (g_GuardRegistered && g_RehldsHookchains) {
+		g_RehldsHookchains->ClientParse()->unregisterHook(NT_ClientParse);
+		g_GuardRegistered = 0;
 	}
 #endif
 	RestoreCvars();
