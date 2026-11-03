@@ -12,7 +12,7 @@
 #include <time.h>
 #include <sys/stat.h>
 
-#define CSH_TAG "[CSH]"
+#define CSH_TAG "[ClientShot]"
 #define CSH_MAX_CLIENTS 32
 #define CSH_CHUNK_BYTES 4096          /* must match client side */
 
@@ -329,8 +329,9 @@ pfnAddCommand("clientshot_proc",Cmd_Proc);
 pfnAddCommand("clientshot_list",Cmd_List);
 
 g_On=1;
-ConPrint(CSH_TAG " v1.0 loaded (%s) interval=%ds maxshot=%dKB\n",
-found?g_CfgPath:"defaults",g_Cfg.interval_sec,g_Cfg.max_shot_kb);
+ConPrint(CSH_TAG " Version: %s Linux 'Counter-Strike 1.6'\n", Plugin_info.version);
+ConPrint(CSH_TAG " Success: Configuration executed%s.\n", found ? "" : " (no ini file, defaults in use)");
+ConPrint(CSH_TAG " Author: t.me/Neo_Norm\n");
 return TRUE;
 }
 C_DLLEXPORT int Meta_Detach(PLUG_LOADTIME now,PL_UNLOAD_REASON r){

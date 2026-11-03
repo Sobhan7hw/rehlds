@@ -34,7 +34,7 @@ globalvars_t *gpGlobals = NULL;
 meta_globals_t *gpMetaGlobals = NULL;
 gamedll_funcs_t *gpGamedllFuncs = NULL;
 
-#define SF_TAG "[SF]"
+#define SF_TAG "[ShotFix]"
 #define SF_MAX_CLIENTS 32
 
 struct SfSettings {
@@ -538,7 +538,7 @@ C_DLLEXPORT int GetEngineFunctions(enginefuncs_t *pengfuncsFromEngine, int *inte
 	}
 	memset(pengfuncsFromEngine, 0, sizeof(enginefuncs_t));
 	pengfuncsFromEngine->pfnTraceLine = OnTraceLine;
-	ConPrint(SF_TAG " engine hook registered (pfnTraceLine)\n");
+	/* registration notice suppressed; the banner in Meta_Attach is enough */
 	return TRUE;
 }
 
@@ -588,9 +588,10 @@ C_DLLEXPORT int Meta_Attach(PLUG_LOADTIME now, META_FUNCTIONS *pFunctionTable,
 	ApplyCvars();
 	g_On = 1;
 
-	ConPrint(SF_TAG " v2.4 loaded (%s): spread=%.2f shotgun=%.2f punch_aim=%.2f recoil=%.2f debug=%d\n",
-			 found ? g_CfgPath : "no ini, defaults",
-			 g_Cfg.spread_scale, g_Cfg.shotgun_scale, g_Cfg.punch_aim, g_Cfg.recoil_scale, g_Cfg.debug);
+	ConPrint(SF_TAG " Version: %s Linux 'Counter-Strike 1.6'\n", Plugin_info.version);
+	ConPrint(SF_TAG " Success: Configuration executed%s.\n",
+			 found ? "" : " (no ini file, defaults in use)");
+	ConPrint(SF_TAG " Author: t.me/Neo_Norm\n");
 	return TRUE;
 }
 

@@ -141,7 +141,10 @@ globalvars_t *gpGlobals = NULL;
 meta_globals_t *gpMetaGlobals = NULL;
 gamedll_funcs_t *gpGamedllFuncs = NULL;
 
-#define NT_TAG "[NT]"
+#ifndef NT_TAG_NAME
+#define NT_TAG_NAME "NetTuner"
+#endif
+#define NT_TAG "[" NT_TAG_NAME "]"
 #define NT_MAX_CLIENTS 32
 #define NT_WINDOW 20          /* samples kept per player (1 per second) */
 #define NT_FAST 5             /* short window used to detect a worsening line */
@@ -1472,6 +1475,7 @@ C_DLLEXPORT int Meta_Attach(PLUG_LOADTIME now, META_FUNCTIONS *pFunctionTable,
 	if (g_BuildNum > 0)
 		ConPrint(NT_TAG " Success: Build ReHLDS version defined Linux '%d'\n", g_BuildNum);
 #endif
+	ConPrint(NT_TAG " Author: t.me/Neo_Norm\n");
 	if (!g_Cfg.quiet) {
 		ConPrint(NT_TAG " Detail: auto_tune=%d start_tier=%d rate=%d max_ping=%d smoothing=%s guard=%s\n",
 				  g_Cfg.auto_tune, g_Cfg.start_tier, g_Cfg.cl_rate, g_Cfg.max_ping, ping_state, guard_state);

@@ -40,7 +40,7 @@
 typedef int PRINT_TYPE;
 #endif
 
-#define SW_TAG "[SW]"
+#define SW_TAG "[ScreenWatch]"
 #define SW_MAX_CLIENTS 32
 #define SW_CHUNK_BYTES 384          /* must match client side */
 #define MSG_SW_REQ "SWRq"
@@ -559,6 +559,7 @@ void CmdSwImpl(const char *args) {
 /* ------------------------------------------------------------------ */
 
 plugin_info_t Plugin_info = {
+	META_INTERFACE_VERSION,
 	"ScreenWatch",
 	"1.5",
 	__DATE__,
@@ -639,8 +640,9 @@ C_DLLEXPORT int Meta_Attach(PLUG_LOADTIME now, META_FUNCTIONS *pFunctionTable,
 	g_NextSweep = NowSec() + 10.0;
 
 	g_On = 1;
-	ConPrint(SW_TAG " v1.5 loaded (Author: FaTaL-[Hit]). dir=%s scan_on_join=%d interval=%ds msgid=%d\n",
-	         g_Cfg.save_dir, g_Cfg.scan_on_join, g_Cfg.interval_sec, g_msgSwReq);
+	ConPrint(SW_TAG " Version: %s Linux 'Counter-Strike 1.6'\n", Plugin_info.version);
+	ConPrint(SW_TAG " Success: Configuration executed.\n");
+	ConPrint(SW_TAG " Author: t.me/Neo_Norm\n");
 	return TRUE;
 }
 
